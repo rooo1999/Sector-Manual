@@ -1,253 +1,270 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from datetime import datetime
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Intelligent Momentum Strategy",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- Indicator Calculation Functions (Refined Logic) ---
 
-# --- All calculation functions ---
-def calculate_momentum(series, n_days):
-    """Calculates n-day momentum."""
-    if len(series) < n_days + 1:
+def calculate_momentum(series, n):
+    """Calculates n-period price momentum."""
+    if len(series) > n:
+        # Ensure the denominator is not zero before dividing
+        return (series.iloc[-1] / series.iloc[-n-1]) - 1 if series.iloc[-n-1] != 0 else 0
+    return 0
+
+def calculate_rsi_momentum(series, n=14, roc_period=5):
+    """
+    Calculates the momentum of the RSI value itself.
+    This improved logic measures if relative strength is accelerating, not just if it's high.
+    A positive value indicates RSI is trending up.
+    """
+    if len(series) < n + roc_period:
         return np.nan
-    return (series.iloc[-1] / series.iloc[-n_days - 1]) - 1
-
-def calculate_sma(series, window):
-    """Calculates the entire Simple Moving Average series."""
-    if len(series) < window:
-        return pd.Series(dtype='float64')
-    return series.rolling(window=window).mean()
-
-def calculate_macd(series, fast_period=12, slow_period=26, signal_period=9):
-    """Calculates MACD and Signal Line values."""
-    if len(series) < slow_period:
-        return np.nan, np.nan
-    ema_fast = series.ewm(span=fast_period, adjust=False).mean()
-    ema_slow = series.ewm(span=slow_period, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    return macd_line.iloc[-1], macd_line.ewm(span=signal_period, adjust=False).mean().iloc[-1]
-
-def calculate_cagr(series):
-    """Calculates Compound Annual Growth Rate."""
-    if series.empty or series.iloc[0] == 0:
-        return 0
-    start_val, end_val = series.iloc[0], series.iloc[-1]
-    num_years = (series.index[-1] - series.index[0]).days / 365.25
-    return (end_val / start_val) ** (1 / num_years) - 1 if num_years > 0 else 0
-
-def calculate_sharpe_ratio(returns, risk_free_rate=0.0):
-    """Calculates Sharpe Ratio."""
-    if returns.empty: return 0.0
-    annualized_std = returns.std() * np.sqrt(252)
-    return (returns.mean() * 252 - risk_free_rate) / annualized_std if annualized_std != 0 else np.nan
     
-def calculate_max_drawdown(series):
-    """Calculates Maximum Drawdown from a cumulative series."""
-    if series.empty: return 0.0
-    return (series / series.cummax() - 1).min()
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    
+    # Use Exponential Weighted Moving Average for standard RSI calculation
+    avg_gain = gain.ewm(com=n-1, min_periods=n).mean()
+    avg_loss = loss.ewm(com=n-1, min_periods=n).mean()
+    
+    rs = avg_gain / avg_loss
+    rsi_series = 100 - (100 / (1 + rs))
+    
+    # Calculate the rate of change (momentum) of the RSI over the last few periods
+    if len(rsi_series) > roc_period:
+        return rsi_series.iloc[-1] - rsi_series.iloc[-1 - roc_period]
+    return np.nan
 
-def calculate_drawdown_series(series):
-    """Calculates the full drawdown series for charting."""
-    if series.empty: return pd.Series(dtype=float)
-    return (series - series.cummax()) / series.cummax()
+def calculate_macd_acceleration(series, fast_period=12, slow_period=26, signal_period=9, roc_period=5):
+    """
+    Calculates the acceleration of the MACD Histogram.
+    This improved logic measures if the trend's momentum is strengthening.
+    A positive value means the histogram is growing, indicating accelerating momentum.
+    """
+    if len(series) < slow_period + signal_period + roc_period:
+        return np.nan
 
-# --- Main Application ---
-def main():
-    st.title("🚀 Intelligent Momentum Sector Strategy")
-    st.markdown("This dashboard uses advanced filters and ranking to build and backtest a sector rotation strategy.")
+    fast_ema = series.ewm(span=fast_period, adjust=False).mean()
+    slow_ema = series.ewm(span=slow_period, adjust=False).mean()
+    
+    macd_line = fast_ema - slow_ema
+    signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+    macd_histogram = macd_line - signal_line
+    
+    # Calculate the rate of change (acceleration) of the MACD Histogram
+    if len(macd_histogram) > roc_period:
+        return macd_histogram.iloc[-1] - macd_histogram.iloc[-1 - roc_period]
+    return np.nan
 
-    with st.sidebar:
-        st.header("⚙️ Strategy Parameters")
-        uploaded_file = st.file_uploader("Upload your Excel data file", type=["xlsx", "xls"])
-        
-        if not uploaded_file:
-            st.info("Please upload an Excel file to begin."); return
 
-        @st.cache_data
-        def load_data(file): return pd.read_excel(file, parse_dates=['Date'])
-        
-        sample_df = load_data(uploaded_file)
-        
-        st.subheader("General Settings")
-        min_date, max_date = sample_df['Date'].min().date(), sample_df['Date'].max().date()
-        start_date = st.date_input("Start Date", min_date, min_value=min_date, max_value=max_date)
-        end_date = st.date_input("End Date", max_date, min_value=min_date, max_value=max_date)
-        
-        all_cols = [col for col in sample_df.columns if col != 'Date']
-        benchmark_col = st.selectbox("Select Benchmark", all_cols, index=len(all_cols)-1)
-        all_sectors = [col for col in all_cols if col != benchmark_col]
-        
-        st.subheader("Strategy Configuration")
-        num_sectors_to_invest = st.slider("Number of Top Sectors to Select", 1, len(all_sectors), min(2, len(all_sectors)))
-        concentration_bonus = st.slider("Top Pick Concentration Bonus %", 0, 50, 10, 5, help="Overweight the #1 ranked sector by this percentage.")
+# --- Backtesting Engine (Corrected and Final Version) ---
 
-        st.subheader("Filters & Triggers")
-        use_regime_filter = st.checkbox("Use Market Regime Filter", value=True)
-        regime_sma_lookback = st.number_input("Benchmark SMA for Regime Filter", value=200, min_value=10)
-        
-        # --- NEW: Selectable Risk-Off Mode ---
-        use_risk_off_asset = st.checkbox("Use 'Risk-Off' Asset on Trigger", value=True)
-        risk_off_asset = "CASH (0% Return)"
-        if use_risk_off_asset:
-            risk_off_options = ["CASH (0% Return)"] + all_cols
-            risk_off_asset = st.selectbox("Select 'Risk-Off' Asset", risk_off_options, 0, help="Asset to hold when Market Regime Filter is active.")
+def run_backtest(df, benchmark_col, start_date, end_date, lookback_days, top_n, weights):
+    df_filtered = df[(df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))].copy()
+    sector_cols = [col for col in df.columns if col != benchmark_col]
+    
+    # --- ERROR FIX ---
+    # This corrected method gets the ACTUAL last trading day of each month from the data,
+    # preventing KeyErrors when a calendar month-end is not a trading day.
+    monthly_index_series = df_filtered.index.to_series()
+    rebal_dates = monthly_index_series.groupby(pd.Grouper(freq='M')).max().dropna().tolist()
 
-        st.subheader("Ranking Logic")
-        sma_strategy = st.radio("Select SMA Strategy", ["Price / SMA Ratio", "SMA Crossover", "SMA Rate of Change (ROC)"], index=1, help="**Crossover**: Ranks Fast SMA / Slow SMA. **ROC**: Ranks the slope of the SMA.")
-        with st.expander("Indicator Lookbacks & Weights"):
-            mom_1m_lookback = st.number_input("1M Mom Lookback", 21)
-            mom_3m_lookback = st.number_input("3M Mom Lookback", 63)
-            fast_sma_lookback = st.number_input("Fast SMA Lookback", 50)
-            slow_sma_lookback = st.number_input("Slow SMA Lookback", 200)
-            st.markdown("---")
-            weight_mom_1m = st.slider("1M Momentum Wt", 0.0, 1.0, 0.4)
-            weight_mom_3m = st.slider("3M Momentum Wt", 0.0, 1.0, 0.4)
-            weight_sma_strategy = st.slider("SMA Strategy Wt", 0.0, 1.0, 0.2)
-            weight_macd = st.slider("MACD Weight", 0.0, 1.0, 0.0, help="Ranks based on MACD line value.")
+    portfolio_returns = []
+    historical_selections = {}
+
+    for i in range(len(rebal_dates) - 1):
+        rebal_date = rebal_dates[i]
+        next_rebal_date = rebal_dates[i+1]
+        
+        ranking_data = {}
+        for sector in sector_cols:
+            # Slice the full dataframe up to the rebalance date for accurate history
+            series = df.loc[:rebal_date, sector]
             
-    if st.sidebar.button("🚀 Run Backtest"):
-        # --- 1. Data Preparation ---
-        df = sample_df.set_index(pd.to_datetime(sample_df['Date'])).drop('Date', axis=1, errors='ignore')
-        df = df.loc[str(start_date):str(end_date)].ffill()
+            # Ensure sufficient data for all calculations
+            if len(series) < 70: # Min length for 3M momentum + lookback
+                continue
 
-        with st.spinner('Running backtest... This is the exciting part!'):
-            # --- 2. Backtesting Loop ---
-            rebalance_dates = df.resample('MS').first().index
-            portfolio_returns = []
-            historical_selections = {}
+            # Calculate all factors for the current sector
+            mom_1m = calculate_momentum(series, 21)
+            mom_3m = calculate_momentum(series, 63)
+            rsi_mom = calculate_rsi_momentum(series, n=lookback_days)
+            macd_accel = calculate_macd_acceleration(series)
 
-            for i in range(len(rebalance_dates) - 1):
-                ranking_date, start_period, end_period = rebalance_dates[i], rebalance_dates[i], rebalance_dates[i+1]
-                hist_data = df.loc[:ranking_date]
+            ranking_data[sector] = {
+                "mom_1m": mom_1m, "mom_3m": mom_3m,
+                "rsi_mom": rsi_mom, "macd_accel": macd_accel,
+            }
+        
+        if not ranking_data: continue
+        ranking_df = pd.DataFrame(ranking_data).T.dropna()
+        if ranking_df.empty: continue
 
-                invest_this_month = True
-                if use_regime_filter:
-                    bench_series = hist_data[benchmark_col].dropna()
-                    if len(bench_series) > regime_sma_lookback:
-                        if bench_series.iloc[-1] < bench_series.rolling(regime_sma_lookback).mean().iloc[-1]:
-                            invest_this_month = False
-                    else: invest_this_month = False
+        # Rank each factor (lower rank is better)
+        ranking_df['rank_mom_1m'] = ranking_df['mom_1m'].rank(ascending=False)
+        ranking_df['rank_mom_3m'] = ranking_df['mom_3m'].rank(ascending=False)
+        ranking_df['rank_rsi_mom'] = ranking_df['rsi_mom'].rank(ascending=False)
+        ranking_df['rank_macd_accel'] = ranking_df['macd_accel'].rank(ascending=False)
+        
+        # Calculate the final composite score based on user-defined weights
+        ranking_df['composite_rank'] = (
+            weights['mom_1m'] * ranking_df['rank_mom_1m'] +
+            weights['mom_3m'] * ranking_df['rank_mom_3m'] +
+            weights['rsi_mom'] * ranking_df['rank_rsi_mom'] +
+            weights['macd_accel'] * ranking_df['rank_macd_accel']
+        )
+        
+        # Select the top N sectors with the best (lowest) composite rank
+        top_sectors = ranking_df.sort_values('composite_rank').head(top_n).index.tolist()
+        historical_selections[next_rebal_date.strftime('%Y-%m')] = top_sectors
 
-                if not invest_this_month:
-                    selection_text = "CASH (Regime Filter)"
-                    if use_risk_off_asset and risk_off_asset != "CASH (0% Return)":
-                        selection_text = f"RISK-OFF ({risk_off_asset})"
-                    
-                    historical_selections[start_period.strftime('%Y-%m')] = [selection_text]
-                    period_index = df.loc[start_period:end_period].index[1:]
-                    
-                    if use_risk_off_asset and risk_off_asset != "CASH (0% Return)":
-                        risk_off_returns = df[risk_off_asset].loc[start_period:end_period].pct_change().dropna()
-                        portfolio_returns.append(risk_off_returns)
-                    else:
-                        portfolio_returns.append(pd.Series(0, index=period_index))
-                    continue
+        # --- Calculate portfolio return for the holding period ---
+        period_data = df_filtered.loc[rebal_date:next_rebal_date]
+        
+        # Find the first trading day of the holding period (the day AFTER the rebalance date)
+        buy_date_loc = period_data.index.get_loc(rebal_date) + 1
+        
+        if buy_date_loc < len(period_data.index):
+            holding_start_date = period_data.index[buy_date_loc]
+            holding_end_date = next_rebal_date
 
-                indicator_values = {}
-                for sector in all_sectors:
-                    series = hist_data[sector].dropna()
-                    if len(series) < slow_sma_lookback + 5: continue
-                    
-                    sma_fast = calculate_sma(series, fast_sma_lookback)
-                    sma_slow = calculate_sma(series, slow_sma_lookback)
-                    sma_metric = np.nan
-                    if not sma_fast.empty:
-                        if sma_strategy == "Price / SMA Ratio" and sma_fast.iloc[-1] != 0:
-                            sma_metric = series.iloc[-1] / sma_fast.iloc[-1]
-                        elif sma_strategy == "SMA Crossover" and not sma_slow.empty and sma_slow.iloc[-1] != 0:
-                            sma_metric = sma_fast.iloc[-1] / sma_slow.iloc[-1]
-                        elif sma_strategy == "SMA Rate of Change (ROC)":
-                            roc_period = 21
-                            if len(sma_fast) > roc_period:
-                                sma_metric = (sma_fast.iloc[-1] / sma_fast.iloc[-roc_period-1]) - 1
+            if not top_sectors:
+                monthly_return = 0
+            else:
+                returns = period_data.loc[holding_end_date, top_sectors] / period_data.loc[holding_start_date, top_sectors] - 1
+                monthly_return = returns.mean()
+        else:
+            # Occurs if a month has only one trading day (end of data)
+            monthly_return = 0
+        
+        portfolio_returns.append({'Date': next_rebal_date, 'Strategy': monthly_return})
+    
+    if not portfolio_returns: return None
+        
+    # --- Performance Analysis ---
+    returns_df = pd.DataFrame(portfolio_returns).set_index('Date')
+    benchmark_monthly = df_filtered.loc[returns_df.index, benchmark_col].pct_change().dropna()
+    returns_df['Benchmark'] = benchmark_monthly
+    returns_df = returns_df.dropna()
+    if returns_df.empty: return None
 
-                    indicator_values[sector] = {'mom_1m': calculate_momentum(series, mom_1m_lookback), 'mom_3m': calculate_momentum(series, mom_3m_lookback), 'sma_metric': sma_metric, 'macd': calculate_macd(series)[0]}
+    strategy_equity = (1 + returns_df['Strategy']).cumprod() * 100
+    benchmark_equity = (1 + returns_df['Benchmark']).cumprod() * 100
 
-                indicator_df = pd.DataFrame(indicator_values).T.dropna()
-                if indicator_df.empty or len(indicator_df) < num_sectors_to_invest:
-                    historical_selections[start_period.strftime('%Y-%m')] = ["CASH (No Qualifiers)"]
-                    portfolio_returns.append(pd.Series(0, index=df.loc[start_period:end_period].index[1:]))
-                    continue
+    num_years = max((returns_df.index[-1] - returns_df.index[0]).days / 365.25, 1)
+    
+    cagr_strategy = (strategy_equity.iloc[-1] / 100)**(1/num_years) - 1
+    vol_strategy = returns_df['Strategy'].std() * np.sqrt(12)
+    sharpe_strategy = cagr_strategy / vol_strategy if vol_strategy != 0 else 0
+    drawdown_strategy = (strategy_equity / strategy_equity.cummax() - 1).min()
+    calmar_strategy = cagr_strategy / abs(drawdown_strategy) if drawdown_strategy != 0 else 0
+    
+    cagr_benchmark = (benchmark_equity.iloc[-1] / 100)**(1/num_years) - 1
+    vol_benchmark = returns_df['Benchmark'].std() * np.sqrt(12)
+    sharpe_benchmark = cagr_benchmark / vol_benchmark if vol_benchmark != 0 else 0
+    drawdown_benchmark = (benchmark_equity / benchmark_equity.cummax() - 1).min()
+    calmar_benchmark = cagr_benchmark / abs(drawdown_benchmark) if drawdown_benchmark != 0 else 0
 
-                ranks = pd.DataFrame(index=indicator_df.index)
-                ranks['rank_mom_1m'] = indicator_df['mom_1m'].rank(ascending=False); ranks['rank_mom_3m'] = indicator_df['mom_3m'].rank(ascending=False); ranks['rank_sma'] = indicator_df['sma_metric'].rank(ascending=False); ranks['rank_macd'] = indicator_df['macd'].rank(ascending=False)
-                
-                total_weight = weight_mom_1m + weight_mom_3m + weight_sma_strategy + weight_macd
-                norm_factor = total_weight if total_weight > 0 else 1
-                ranks['composite_score'] = ( (weight_mom_1m / norm_factor) * ranks['rank_mom_1m'] + (weight_mom_3m / norm_factor) * ranks['rank_mom_3m'] + (weight_sma_strategy / norm_factor) * ranks['rank_sma'] + (weight_macd / norm_factor) * ranks['rank_macd'] )
-                
-                top_sectors = ranks.sort_values('composite_score').head(num_sectors_to_invest).index.tolist()
-                historical_selections[start_period.strftime('%Y-%m')] = top_sectors
-                
-                weights = pd.Series(1.0 / num_sectors_to_invest, index=top_sectors)
-                if concentration_bonus > 0 and len(weights) > 1:
-                    bonus = concentration_bonus / 100.0; top_pick = top_sectors[0]
-                    reduction_per_sector = bonus / (len(weights) - 1)
-                    weights[weights.index != top_pick] -= reduction_per_sector
-                    weights[top_pick] += bonus
-                
-                investment_period_df = df.loc[start_period:end_period, top_sectors]
-                monthly_portfolio_returns = (investment_period_df.pct_change().dropna() * weights).sum(axis=1)
-                portfolio_returns.append(monthly_portfolio_returns)
+    turnover = []
+    selections_list = list(historical_selections.values())
+    for i in range(1, len(selections_list)):
+        new_names = len(set(selections_list[i]) - set(selections_list[i-1]))
+        turnover.append(new_names / top_n)
+    churn_ratio = np.mean(turnover) if turnover else 0
 
-            # --- 3. Analysis and Display ---
-            if not portfolio_returns: st.error("Backtest generated no returns."); return
+    metrics = {
+        'Metric': ['CAGR', 'Annualized Volatility', 'Sharpe Ratio', 'Max Drawdown', 'Calmar Ratio'],
+        'Strategy': [cagr_strategy, vol_strategy, sharpe_strategy, drawdown_strategy, calmar_strategy],
+        'Benchmark': [cagr_benchmark, vol_benchmark, sharpe_benchmark, drawdown_benchmark, calmar_benchmark]
+    }
+    
+    results = {
+        "strategy_equity": strategy_equity, "benchmark_equity": benchmark_equity,
+        "metrics": pd.DataFrame(metrics), "monthly_returns": returns_df,
+        "historical_selections": pd.DataFrame.from_dict(historical_selections, orient='index', columns=[f'Top_{i+1}' for i in range(top_n)]),
+        "churn_ratio": churn_ratio
+    }
+    return results
 
-            strategy_returns = pd.concat(portfolio_returns).sort_index().loc[lambda x: ~x.index.duplicated(keep='first')]
-            benchmark_returns = df[benchmark_col].pct_change().loc[strategy_returns.index]
+# --- Streamlit User Interface ---
+
+st.set_page_config(layout="wide")
+st.title("Enhanced Momentum Sector Rotation Strategy")
+st.markdown("This model uses **1M/3M Price Momentum**, **RSI Momentum**, and **MACD Acceleration** to rank and select top-performing sectors monthly.")
+
+# --- Sidebar for Controls ---
+st.sidebar.header("Strategy Controls")
+uploaded_file = st.sidebar.file_uploader("Upload your sectoral data (Excel)", type=["xlsx"])
+
+if uploaded_file:
+    df = pd.read_excel(uploaded_file, engine='openpyxl')
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.set_index('Date').sort_index()
+    all_cols = df.columns.tolist()
+
+    st.sidebar.subheader("General Settings")
+    start_date = st.sidebar.date_input("Start Date", df.index.min().date())
+    end_date = st.sidebar.date_input("End Date", df.index.max().date())
+    benchmark_col = st.sidebar.selectbox("Select Benchmark Column", all_cols, index=len(all_cols)-1)
+    lookback_days = st.sidebar.number_input("RSI Lookback Period (Days)", min_value=10, max_value=50, value=14, step=1, help="The period for the base RSI calculation.")
+    top_n = st.sidebar.number_input("Number of Sectors to Select", min_value=1, max_value=10, value=2, step=1)
+
+    st.sidebar.subheader("Factor Weights")
+    st.sidebar.markdown("_Define the importance of each factor in the ranking._")
+    weights = {
+        'mom_1m': st.sidebar.slider("1-Month Momentum Weight", 0.0, 5.0, 1.0, 0.1),
+        'mom_3m': st.sidebar.slider("3-Month Momentum Weight", 0.0, 5.0, 1.0, 0.1),
+        'rsi_mom': st.sidebar.slider("RSI Momentum Weight", 0.0, 5.0, 1.0, 0.1),
+        'macd_accel': st.sidebar.slider("MACD Acceleration Weight", 0.0, 5.0, 1.0, 0.1)
+    }
+
+    if st.sidebar.button("Run Backtest", type="primary"):
+        with st.spinner("Running backtest... This may take a moment."):
+            results = run_backtest(df, benchmark_col, start_date, end_date, lookback_days, top_n, weights)
+        
+        if results:
+            st.header("Backtest Results")
             
-            strategy_cumulative, benchmark_cumulative = (1 + strategy_returns).cumprod(), (1 + benchmark_returns).cumprod()
-            strategy_cagr, benchmark_cagr = calculate_cagr(strategy_cumulative), calculate_cagr(benchmark_cumulative)
-            strategy_sharpe, benchmark_sharpe = calculate_sharpe_ratio(strategy_returns), calculate_sharpe_ratio(benchmark_returns)
-            strategy_mdd, benchmark_mdd = calculate_max_drawdown(strategy_cumulative), calculate_max_drawdown(benchmark_cumulative)
+            # --- Key Metrics Dashboard ---
+            st.subheader("Key Performance Indicators")
+            col1, col2, col3, col4 = st.columns(4)
+            metrics_data = results['metrics'].set_index('Metric')
+            col1.metric("Strategy CAGR", f"{metrics_data.loc['CAGR', 'Strategy']:.2%}")
+            col1.metric("Benchmark CAGR", f"{metrics_data.loc['CAGR', 'Benchmark']:.2%}")
+            col2.metric("Strategy Sharpe Ratio", f"{metrics_data.loc['Sharpe Ratio', 'Strategy']:.2f}")
+            col2.metric("Benchmark Sharpe Ratio", f"{metrics_data.loc['Sharpe Ratio', 'Benchmark']:.2f}")
+            col3.metric("Strategy Max Drawdown", f"{metrics_data.loc['Max Drawdown', 'Strategy']:.2%}")
+            col3.metric("Benchmark Max Drawdown", f"{metrics_data.loc['Max Drawdown', 'Benchmark']:.2%}")
+            col4.metric("Strategy Calmar Ratio", f"{metrics_data.loc['Calmar Ratio', 'Strategy']:.2f}")
+            col4.metric("Churn Ratio", f"{results['churn_ratio']:.2%}", help="The average monthly percentage of sectors that are replaced.")
 
-            st.header("📊 Backtest Performance")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Strategy CAGR", f"{strategy_cagr:.2%}"); col1.metric(f"{benchmark_col} CAGR", f"{benchmark_cagr:.2%}")
-            col2.metric("Strategy Sharpe Ratio", f"{strategy_sharpe:.2f}"); col2.metric(f"{benchmark_col} Sharpe Ratio", f"{benchmark_sharpe:.2f}")
-            col3.metric("Strategy Max Drawdown", f"{strategy_mdd:.2%}"); col3.metric(f"{benchmark_col} Max Drawdown", f"{benchmark_mdd:.2%}")
-            
-            st.subheader("Growth of Initial Investment")
-            initial_investment = st.number_input("Initial Investment Amount", min_value=1, value=10000, step=1000, key="growth_investment")
-            fig_growth = go.Figure()
-            fig_growth.add_trace(go.Scatter(x=strategy_cumulative.index, y=strategy_cumulative * initial_investment, name='Strategy', line=dict(color='royalblue', width=2)))
-            fig_growth.add_trace(go.Scatter(x=benchmark_cumulative.index, y=benchmark_cumulative * initial_investment, name=benchmark_col, line=dict(color='grey', dash='dash')))
-            fig_growth.update_layout(title_text=f'Growth of ₹{initial_investment:,.0f}', yaxis_title='Portfolio Value (₹)')
-            st.plotly_chart(fig_growth, use_container_width=True)
+            # --- Equity Curve Chart ---
+            st.subheader("Equity Curve")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=results['strategy_equity'].index, y=results['strategy_equity'], mode='lines', name='Strategy', line=dict(color='royalblue', width=2)))
+            fig.add_trace(go.Scatter(x=results['benchmark_equity'].index, y=results['benchmark_equity'], mode='lines', name='Benchmark', line=dict(color='grey', width=2)))
+            fig.update_layout(title='Strategy vs. Benchmark: Growth of ₹100', xaxis_title='Date', yaxis_title='Portfolio Value', legend_title_text='Legend')
+            st.plotly_chart(fig, use_container_width=True)
 
-            st.subheader("Drawdown Periods")
-            fig_dd = go.Figure(); fig_dd.add_trace(go.Scatter(x=strategy_cumulative.index, y=calculate_drawdown_series(strategy_cumulative), fill='tozeroy', mode='lines', name='Strategy Drawdown', line=dict(color='crimson'))); fig_dd.add_trace(go.Scatter(x=benchmark_cumulative.index, y=calculate_drawdown_series(benchmark_cumulative), mode='lines', name='Benchmark Drawdown', line=dict(color='grey', dash='dash')))
-            fig_dd.update_layout(title_text='Strategy vs. Benchmark Drawdowns', yaxis_title='Drawdown', yaxis_tickformat='.0%')
-            st.plotly_chart(fig_dd, use_container_width=True)
-
-            st.header("📋 Detailed Data & History")
-            # --- RESTORED TABS ---
-            tab1, tab2, tab3 = st.tabs(["Current Snapshot", "Historical Selections", "Monthly Returns"])
+            # --- Detailed Results in Tabs ---
+            tab1, tab2, tab3 = st.tabs(["Performance Metrics", "Historical Selections", "Monthly Returns"])
             with tab1:
-                st.markdown(f"**Indicator values and ranks as of {df.index[-1].strftime('%Y-%m-%d')}**")
-                current_indicators = {}
-                for sector in all_sectors:
-                    series = df[sector].dropna()
-                    if len(series) < slow_sma_lookback: continue
-                    current_indicators[sector] = { "Price": series.iloc[-1], "1M Mom": calculate_momentum(series, mom_1m_lookback), "3M Mom": calculate_momentum(series, mom_3m_lookback) }
-                current_df = pd.DataFrame(current_indicators).T.dropna()
-                if not current_df.empty:
-                    current_df['1M_Rank'] = current_df['1M Mom'].rank(ascending=False, method='first')
-                    current_df['3M_Rank'] = current_df['3M Mom'].rank(ascending=False, method='first')
-                    st.dataframe(current_df.style.format({'Price': '{:,.2f}', '1M Mom': '{:.2%}', '3M Mom': '{:.2%}'}).background_gradient(cmap='viridis_r', subset=['1M_Rank', '3M_Rank']), use_container_width=True)
+                st.dataframe(results['metrics'].set_index('Metric').style.format(
+                    {'Strategy': '{:.2%}', 'Benchmark': '{:.2%}'}, subset=['CAGR', 'Annualized Volatility', 'Max Drawdown']
+                ).format(
+                    {'Strategy': '{:.2f}', 'Benchmark': '{:.2f}'}, subset=['Sharpe Ratio', 'Calmar Ratio']
+                ))
             with tab2:
-                st.write("Sectors selected at the beginning of each month."); selections_df = pd.DataFrame.from_dict(historical_selections, orient='index'); selections_df.index.name = 'Month'
-                st.dataframe(selections_df, use_container_width=True)
+                st.subheader("Monthly Sector Selections")
+                st.dataframe(results['historical_selections'])
             with tab3:
-                st.write("Monthly performance comparison."); strat_monthly = strategy_returns.resample('M').apply(lambda x: (1 + x).prod() - 1).to_frame('Strategy'); bench_monthly = benchmark_returns.resample('M').apply(lambda x: (1 + x).prod() - 1).to_frame('Benchmark')
-                monthly_df = pd.concat([strat_monthly, bench_monthly], axis=1).dropna(); monthly_df['Outperformance'] = monthly_df['Strategy'] - monthly_df['Benchmark']
-                monthly_df.index = monthly_df.index.strftime('%Y-%m')
-                st.dataframe(monthly_df.style.format('{:.2%}').background_gradient(cmap='RdYlGn', subset=['Outperformance']), use_container_width=True)
-
-if __name__ == '__main__':
-    main()
+                st.subheader("Strategy vs. Benchmark Monthly Returns")
+                st.dataframe(results['monthly_returns'].style.format('{:.2%}'))
+        else:
+            st.error("Backtest failed. Please check your data and parameters. The selected date range may not have enough data for calculations (at least ~4 months is recommended).")
+else:
+    st.info("Please upload an Excel file with your sectoral data to begin the analysis.")
