@@ -100,6 +100,8 @@ def calculate_max_drawdown(series):
     drawdown = (series - cumulative_max) / cumulative_max
     return drawdown.min()
 
+# (Keep all the functions from the previous code: calculate_momentum, calculate_sma, etc.)
+
 # --- Main Application ---
 def main():
     st.title("📈 Momentum-Based Sector Rotation Strategy")
@@ -108,7 +110,7 @@ def main():
     The strategy selects the top N sectors each month, holds them for the month, and then rebalances.
     """)
 
-    # --- Sidebar for User Inputs ---
+    # --- Sidebar for User Inputs (This part remains the same) ---
     with st.sidebar:
         st.header("⚙️ Strategy Parameters")
 
@@ -126,7 +128,6 @@ def main():
             
             sample_df = load_data(uploaded_file)
             
-            # --- Date and Sector Selection ---
             st.subheader("General Settings")
             min_date = sample_df['Date'].min().date()
             max_date = sample_df['Date'].max().date()
@@ -134,14 +135,11 @@ def main():
             start_date = st.date_input("Start Date", min_date, min_value=min_date, max_value=max_date)
             end_date = st.date_input("End Date", max_date, min_value=min_date, max_value=max_date)
             
-            # ## --- CHANGE START: Make benchmark selectable ---
-            # Get all columns that are not 'Date'
             potential_benchmark_cols = [col for col in sample_df.columns if col != 'Date']
             if not potential_benchmark_cols:
                 st.error("Your file must contain price columns besides the 'Date' column.")
                 return
 
-            # Intelligently guess the default benchmark
             default_benchmark_index = 0
             for i, col in enumerate(potential_benchmark_cols):
                 if 'bench' in col.lower() or 'nifty' in col.lower() and '50' in col.lower():
@@ -154,22 +152,19 @@ def main():
                 index=default_benchmark_index
             )
 
-            # Define sectors as all columns except Date and the chosen Benchmark
             all_sectors = [col for col in sample_df.columns if col not in ['Date', benchmark_col]]
             if not all_sectors:
-                st.warning("No sectors available to trade after selecting the benchmark. Please upload a file with at least one sector column and one benchmark column.")
+                st.warning("No sectors available to trade. Please upload a file with at least one sector and one benchmark column.")
                 return
-            # ## --- CHANGE END ---
 
             num_sectors_to_invest = st.slider(
                 "Number of Top Sectors to Select", 
                 min_value=1, 
                 max_value=len(all_sectors), 
-                value=min(2, len(all_sectors)), # Default to 2 or max available
+                value=min(2, len(all_sectors)),
                 step=1
             )
             
-            # --- Indicator Lookbacks ---
             with st.expander("Indicator Lookback Periods"):
                 mom_1m_lookback = st.number_input("1-Month Momentum Lookback (days)", value=21)
                 mom_3m_lookback = st.number_input("3-Month Momentum Lookback (days)", value=63)
@@ -178,7 +173,6 @@ def main():
                 rsi_lookback = st.number_input("RSI Lookback (days)", value=14)
                 volatility_lookback = st.number_input("Volatility Lookback (days)", value=21)
 
-            # --- Indicator Weights ---
             with st.expander("Indicator Ranking Weights"):
                 st.markdown("Set the importance of each indicator for ranking. Higher is better.")
                 weight_mom_1m = st.slider("1-Month Momentum Weight", 0.0, 1.0, 0.25)
@@ -195,21 +189,17 @@ def main():
     # --- Main Panel: Data Loading and Backtesting ---
     if st.sidebar.button("🚀 Run Backtest"):
         
-        # --- 1. Data Preparation ---
         df = sample_df.copy()
         df['Date'] = pd.to_datetime(df['Date'])
         df = df.set_index('Date')
         df = df.loc[str(start_date):str(end_date)]
-        df.dropna(axis=0, how='all', inplace=True) # Drop rows where all values are missing
-        df.ffill(inplace=True) # Forward-fill to handle missing values like holidays
+        df.dropna(axis=0, how='all', inplace=True) 
+        df.ffill(inplace=True) 
 
         sectors = all_sectors
         
-        # --- 2. Backtesting Logic ---
         with st.spinner('Running backtest... This might take a moment.'):
-            # Get rebalancing dates (first trading day of each month)
             rebalance_dates = df.resample('MS').first().index
-
             portfolio_returns = []
             historical_selections = {}
             last_month_selections = []
@@ -222,15 +212,29 @@ def main():
                 hist_data = df.loc[:ranking_date]
                 if hist_data.empty: continue
 
-                ranks = pd.DataFrame(index=sectors)
                 indicator_values = {}
                 for sector in sectors:
                     series = hist_data[sector].dropna()
+                    
+                    # ### --- THE FIX IS HERE --- ###
+                    # If the series is empty after dropping NaNs, it means the sector has no
+                    # data up to this point. Skip it for this month's ranking.
+                    if series.empty:
+                        continue
+                    # ### ----------------------- ###
+
+                    # More efficient and safe calculation for sma_ratio
+                    sma_val = calculate_sma(series, sma_lookback)
+                    if sma_val and not np.isnan(sma_val) and sma_val != 0:
+                        sma_ratio = series.iloc[-1] / sma_val
+                    else:
+                        sma_ratio = np.nan
+
                     indicator_values[sector] = {
                         'mom_1m': calculate_momentum(series, mom_1m_lookback),
                         'mom_3m': calculate_momentum(series, mom_3m_lookback),
                         'mom_6m': calculate_momentum(series, mom_6m_lookback),
-                        'sma_ratio': series.iloc[-1] / calculate_sma(series, sma_lookback) if calculate_sma(series, sma_lookback) else np.nan,
+                        'sma_ratio': sma_ratio, # Use the safely calculated value
                         'rsi': calculate_rsi(series, rsi_lookback),
                         'macd': calculate_macd(series)[0],
                         'volatility': calculate_volatility(series, volatility_lookback)
@@ -240,6 +244,7 @@ def main():
                 
                 if indicator_df.empty or len(indicator_df) < num_sectors_to_invest: continue
 
+                ranks = pd.DataFrame(index=indicator_df.index) # Use index from indicator_df to avoid errors
                 ranks['rank_mom_1m'] = indicator_df['mom_1m'].rank(ascending=False)
                 ranks['rank_mom_3m'] = indicator_df['mom_3m'].rank(ascending=False)
                 ranks['rank_mom_6m'] = indicator_df['mom_6m'].rank(ascending=False)
@@ -261,6 +266,8 @@ def main():
                 ranks = ranks.dropna()
                 top_sectors = ranks.sort_values(by='composite_score', ascending=True).head(num_sectors_to_invest).index.tolist()
                 
+                if not top_sectors: continue # Skip if no sectors were selected
+                
                 historical_selections[start_period.strftime('%Y-%m')] = top_sectors
                 
                 investment_period_df = df.loc[start_period:end_period]
@@ -272,16 +279,13 @@ def main():
                 st.error("Could not generate a portfolio. This might be due to a short date range or insufficient data for the lookback periods.")
                 return
 
-            # --- 6. Consolidate and Analyze Results ---
+            # --- Results processing and display (This part remains the same) ---
             strategy_returns = pd.concat(portfolio_returns)
             strategy_cumulative = (1 + strategy_returns).cumprod()
             
-            # ## --- CHANGE START: Use the selected benchmark column ---
             benchmark_returns = df[benchmark_col].pct_change().loc[strategy_returns.index]
-            # ## --- CHANGE END ---
             benchmark_cumulative = (1 + benchmark_returns).cumprod()
             
-            # --- Performance Metrics Calculation ---
             strategy_cagr = calculate_cagr(strategy_cumulative)
             benchmark_cagr = calculate_cagr(benchmark_cumulative)
             strategy_sharpe = calculate_sharpe_ratio(strategy_returns)
@@ -297,7 +301,6 @@ def main():
                 last_month_selections = selections
             churn_ratio = total_turnover / (len(historical_selections) * num_sectors_to_invest) if historical_selections else 0
 
-            # --- 7. Display Results ---
             st.header("📊 Backtest Results")
             
             col1, col2, col3, col4 = st.columns(4)
@@ -325,7 +328,8 @@ def main():
             with st.expander("View Historical Monthly Sector Selections"):
                 selections_df = pd.DataFrame.from_dict(historical_selections, orient='index')
                 selections_df.index.name = 'Month'
-                selections_df.columns = [f'Sector_{i+1}' for i in range(num_sectors_to_invest)]
+                if not selections_df.empty:
+                    selections_df.columns = [f'Sector_{i+1}' for i in range(len(selections_df.columns))]
                 st.dataframe(selections_df)
             
             with st.expander("View Monthly Returns Breakdown"):
@@ -336,3 +340,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
