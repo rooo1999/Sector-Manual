@@ -67,9 +67,6 @@ def run_backtest(df, benchmark_col, start_date, end_date, lookback_days, top_n, 
     df_filtered = df[(df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))].copy()
     sector_cols = [col for col in df.columns if col != benchmark_col]
     
-    # --- ERROR FIX ---
-    # This corrected method gets the ACTUAL last trading day of each month from the data,
-    # preventing KeyErrors when a calendar month-end is not a trading day.
     monthly_index_series = df_filtered.index.to_series()
     rebal_dates = monthly_index_series.groupby(pd.Grouper(freq='M')).max().dropna().tolist()
 
@@ -82,14 +79,11 @@ def run_backtest(df, benchmark_col, start_date, end_date, lookback_days, top_n, 
         
         ranking_data = {}
         for sector in sector_cols:
-            # Slice the full dataframe up to the rebalance date for accurate history
             series = df.loc[:rebal_date, sector]
             
-            # Ensure sufficient data for all calculations
-            if len(series) < 70: # Min length for 3M momentum + lookback
+            if len(series) < 70: 
                 continue
 
-            # Calculate all factors for the current sector
             mom_1m = calculate_momentum(series, 21)
             mom_3m = calculate_momentum(series, 63)
             rsi_mom = calculate_rsi_momentum(series, n=lookback_days)
@@ -104,13 +98,11 @@ def run_backtest(df, benchmark_col, start_date, end_date, lookback_days, top_n, 
         ranking_df = pd.DataFrame(ranking_data).T.dropna()
         if ranking_df.empty: continue
 
-        # Rank each factor (lower rank is better)
         ranking_df['rank_mom_1m'] = ranking_df['mom_1m'].rank(ascending=False)
         ranking_df['rank_mom_3m'] = ranking_df['mom_3m'].rank(ascending=False)
         ranking_df['rank_rsi_mom'] = ranking_df['rsi_mom'].rank(ascending=False)
         ranking_df['rank_macd_accel'] = ranking_df['macd_accel'].rank(ascending=False)
         
-        # Calculate the final composite score based on user-defined weights
         ranking_df['composite_rank'] = (
             weights['mom_1m'] * ranking_df['rank_mom_1m'] +
             weights['mom_3m'] * ranking_df['rank_mom_3m'] +
@@ -118,14 +110,10 @@ def run_backtest(df, benchmark_col, start_date, end_date, lookback_days, top_n, 
             weights['macd_accel'] * ranking_df['rank_macd_accel']
         )
         
-        # Select the top N sectors with the best (lowest) composite rank
         top_sectors = ranking_df.sort_values('composite_rank').head(top_n).index.tolist()
         historical_selections[next_rebal_date.strftime('%Y-%m')] = top_sectors
 
-        # --- Calculate portfolio return for the holding period ---
         period_data = df_filtered.loc[rebal_date:next_rebal_date]
-        
-        # Find the first trading day of the holding period (the day AFTER the rebalance date)
         buy_date_loc = period_data.index.get_loc(rebal_date) + 1
         
         if buy_date_loc < len(period_data.index):
@@ -138,14 +126,12 @@ def run_backtest(df, benchmark_col, start_date, end_date, lookback_days, top_n, 
                 returns = period_data.loc[holding_end_date, top_sectors] / period_data.loc[holding_start_date, top_sectors] - 1
                 monthly_return = returns.mean()
         else:
-            # Occurs if a month has only one trading day (end of data)
             monthly_return = 0
         
         portfolio_returns.append({'Date': next_rebal_date, 'Strategy': monthly_return})
     
     if not portfolio_returns: return None
         
-    # --- Performance Analysis ---
     returns_df = pd.DataFrame(portfolio_returns).set_index('Date')
     benchmark_monthly = df_filtered.loc[returns_df.index, benchmark_col].pct_change().dropna()
     returns_df['Benchmark'] = benchmark_monthly
@@ -196,7 +182,6 @@ st.set_page_config(layout="wide")
 st.title("Enhanced Momentum Sector Rotation Strategy")
 st.markdown("This model uses **1M/3M Price Momentum**, **RSI Momentum**, and **MACD Acceleration** to rank and select top-performing sectors monthly.")
 
-# --- Sidebar for Controls ---
 st.sidebar.header("Strategy Controls")
 uploaded_file = st.sidebar.file_uploader("Upload your sectoral data (Excel)", type=["xlsx"])
 
@@ -229,7 +214,6 @@ if uploaded_file:
         if results:
             st.header("Backtest Results")
             
-            # --- Key Metrics Dashboard ---
             st.subheader("Key Performance Indicators")
             col1, col2, col3, col4 = st.columns(4)
             metrics_data = results['metrics'].set_index('Metric')
@@ -242,7 +226,6 @@ if uploaded_file:
             col4.metric("Strategy Calmar Ratio", f"{metrics_data.loc['Calmar Ratio', 'Strategy']:.2f}")
             col4.metric("Churn Ratio", f"{results['churn_ratio']:.2%}", help="The average monthly percentage of sectors that are replaced.")
 
-            # --- Equity Curve Chart ---
             st.subheader("Equity Curve")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=results['strategy_equity'].index, y=results['strategy_equity'], mode='lines', name='Strategy', line=dict(color='royalblue', width=2)))
@@ -250,14 +233,23 @@ if uploaded_file:
             fig.update_layout(title='Strategy vs. Benchmark: Growth of ₹100', xaxis_title='Date', yaxis_title='Portfolio Value', legend_title_text='Legend')
             st.plotly_chart(fig, use_container_width=True)
 
-            # --- Detailed Results in Tabs ---
             tab1, tab2, tab3 = st.tabs(["Performance Metrics", "Historical Selections", "Monthly Returns"])
             with tab1:
-                st.dataframe(results['metrics'].set_index('Metric').style.format(
-                    {'Strategy': '{:.2%}', 'Benchmark': '{:.2%}'}, subset=['CAGR', 'Annualized Volatility', 'Max Drawdown']
+                # --- ERROR FIX ---
+                # This corrected method uses a formatter dictionary to apply specific formats
+                # to different rows, which is the correct and robust way to use pandas styling.
+                metrics_df_styled = results['metrics'].set_index('Metric')
+                format_dict = {
+                    'Strategy': '{:.2%}', 'Benchmark': '{:.2%}'
+                }
+                st.dataframe(metrics_df_styled.style.format(
+                    formatter=format_dict,
+                    subset=['CAGR', 'Annualized Volatility', 'Max Drawdown']
                 ).format(
-                    {'Strategy': '{:.2f}', 'Benchmark': '{:.2f}'}, subset=['Sharpe Ratio', 'Calmar Ratio']
+                    formatter='{:.2f}',
+                    subset=['Sharpe Ratio', 'Calmar Ratio']
                 ))
+
             with tab2:
                 st.subheader("Monthly Sector Selections")
                 st.dataframe(results['historical_selections'])
