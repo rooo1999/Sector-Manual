@@ -96,7 +96,6 @@ def main():
         benchmark_col = st.selectbox("Select Benchmark", all_cols, index=len(all_cols) - 1 if all_cols else 0)
         all_sectors = [col for col in all_cols if col != benchmark_col]
         
-        # Risk-Off Asset Selection
         risk_off_options = ["CASH (0% Return)"] + all_cols
         risk_off_asset = st.selectbox(
             "Select 'Risk-Off' Asset", 
@@ -142,12 +141,10 @@ def main():
             weight_macd = st.slider("MACD Weight", 0.0, 1.0, 0.0, help="Ranks based on MACD line value.")
             
     if st.sidebar.button("🚀 Run Backtest"):
-        # --- 1. Data Preparation ---
         df = sample_df.set_index(pd.to_datetime(sample_df['Date'])).drop('Date', axis=1, errors='ignore')
         df = df.loc[str(start_date):str(end_date)].ffill()
 
         with st.spinner('Running backtest... This is the exciting part!'):
-            # --- 2. Backtesting Loop ---
             rebalance_dates = df.resample('MS').first().index
             portfolio_returns = []
             historical_selections = {}
@@ -179,21 +176,21 @@ def main():
                 indicator_values = {}
                 for sector in all_sectors:
                     series = hist_data[sector].dropna()
-                    if len(series) < slow_sma_lookback: continue
+                    if len(series) < slow_sma_lookback + 5: continue # Ensure enough data
                     
                     sma_fast = calculate_sma(series, fast_sma_lookback)
                     sma_slow = calculate_sma(series, slow_sma_lookback)
                     sma_metric = np.nan
-                    if sma_strategy == "Price / SMA Ratio":
-                        if not sma_fast.empty and sma_fast.iloc[-1] != 0:
+                    
+                    if not sma_fast.empty:
+                        if sma_strategy == "Price / SMA Ratio" and sma_fast.iloc[-1] != 0:
                             sma_metric = series.iloc[-1] / sma_fast.iloc[-1]
-                    elif sma_strategy == "SMA Crossover":
-                        if not sma_fast.empty and not sma_slow.empty and sma_slow.iloc[-1] != 0:
+                        elif sma_strategy == "SMA Crossover" and not sma_slow.empty and sma_slow.iloc[-1] != 0:
                             sma_metric = sma_fast.iloc[-1] / sma_slow.iloc[-1]
-                    elif sma_strategy == "SMA Rate of Change (ROC)":
-                        roc_period = 21 # ~1 month
-                        if len(sma_fast) > roc_period:
-                            sma_metric = (sma_fast.iloc[-1] / sma_fast.iloc[-roc_period -1]) - 1
+                        elif sma_strategy == "SMA Rate of Change (ROC)":
+                            roc_period = 21 # ~1 month
+                            if len(sma_fast) > roc_period:
+                                sma_metric = (sma_fast.iloc[-1] / sma_fast.iloc[-roc_period -1]) - 1
 
                     indicator_values[sector] = {
                         'mom_1m': calculate_momentum(series, mom_1m_lookback),
@@ -236,7 +233,6 @@ def main():
                 monthly_portfolio_returns = (investment_period_df.pct_change().dropna() * weights).sum(axis=1)
                 portfolio_returns.append(monthly_portfolio_returns)
 
-            # --- 3. Analysis and Display ---
             if not portfolio_returns:
                 st.error("Backtest generated no returns. Check date range or filter settings."); return
 
@@ -262,7 +258,17 @@ def main():
             col3.metric(f"{benchmark_col} Max Drawdown", f"{benchmark_mdd:.2%}")
             
             st.subheader("Growth of Initial Investment")
-            initial_investment = st.number_input("Initial Investment Amount", 10000, 1000, key="growth_investment")
+            
+            # --- THE FIX IS HERE ---
+            initial_investment = st.number_input(
+                "Initial Investment Amount", 
+                min_value=1000, 
+                value=10000, 
+                step=1000, 
+                key="growth_investment"
+            )
+            # --- END OF FIX ---
+
             fig_growth = go.Figure()
             fig_growth.add_trace(go.Scatter(x=strategy_cumulative.index, y=strategy_cumulative * initial_investment, name='Strategy', line=dict(color='royalblue', width=2)))
             fig_growth.add_trace(go.Scatter(x=benchmark_cumulative.index, y=benchmark_cumulative * initial_investment, name=benchmark_col, line=dict(color='grey', dash='dash')))
