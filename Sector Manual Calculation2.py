@@ -55,7 +55,7 @@ def run_backtest(price_df, universe_cols, benchmark_col, lookback_period, top_n,
     """The core backtest engine with dynamic universe and new filters."""
     momentum = price_df.pct_change(lookback_period)
     benchmark_sma = price_df[benchmark_col].rolling(window=cash_rule_params['sma_period']).mean()
-    rebalance_dates = price_df.resample('M').first().index
+    rebalance_dates = price_df.resample('MS').first().index # Use Month-Start frequency
     positions = pd.DataFrame(index=price_df.index, columns=universe_cols).fillna(0)
     last_positions = pd.Series(0, index=universe_cols)
 
@@ -200,10 +200,15 @@ if uploaded_file:
 
             with tab3:
                 st.header("Historical Portfolio Allocations")
-                # CORRECTED LOGIC: Show every rebalancing period, not just changes
-                rebalance_dates = positions.resample('M').first().index
-                historical_holdings = positions[positions.index.isin(rebalance_dates)]
-                display_holdings = historical_holdings.apply(lambda row: ', '.join(row[row==1].index) or 'CASH', axis=1).to_frame("Sectors Held")
+                # CORRECTED, ROBUST LOGIC FOR MONTHLY SNAPSHOTS
+                # Resample to the start of each month ('MS'), get the first valid entry in that month,
+                # and drop any months that had no trading data. This is foolproof.
+                monthly_positions = positions.resample('MS').first().dropna(how='all')
+                display_holdings = monthly_positions.apply(lambda row: ', '.join(row[row==1].index) or 'CASH', axis=1).to_frame("Sectors Held")
+                
+                # Format index for readability
+                display_holdings.index = display_holdings.index.strftime('%Y-%b')
+                
                 st.dataframe(display_holdings.sort_index(ascending=False), use_container_width=True)
 else:
     st.info("Upload an XLSX file using the sidebar to begin.")
