@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Dynamic Momentum & Indicator Strategy Backtester",
+    page_title="Dynamic Momentum Strategy Backtester",
     layout="wide",
 )
 
@@ -152,7 +152,6 @@ def run_backtest(price_df, universe_cols, benchmark_col, lookback_period, top_n,
     return portfolio_daily_returns, benchmark_daily_returns, momentum, positions
 
 # --- Streamlit UI ---
-st.set_option('deprecation.showPyplotGlobalUse', False)
 st.title("📈 Dynamic Momentum Strategy Backtester")
 
 # --- Sidebar ---
