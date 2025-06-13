@@ -5,249 +5,238 @@ import plotly.graph_objects as go
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Sector Rotation Strategy Backtester",
+    page_title="Advanced Sector Rotation Backtester",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- Caching Functions for Performance ---
+# --- Caching & Data Loading ---
 @st.cache_data
 def load_data(file):
-    """Loads and preprocesses the data from an Excel file."""
-    # CORRECTED: Use pd.read_excel to handle .xlsx files
-    df = pd.read_excel(file) 
-    
-    # Ensure the 'Date' column is handled robustly
-    if 'Date' not in df.columns:
-        st.error("Error: A 'Date' column was not found in the uploaded file.")
+    """Loads and preprocesses data from an Excel file."""
+    try:
+        df = pd.read_excel(file)
+        if 'Date' not in df.columns:
+            st.error("Error: A 'Date' column was not found in the uploaded file.")
+            return None
+        df['Date'] = pd.to_datetime(df['Date'], dayfirst=True)
+        df = df.set_index('Date')
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.ffill() # Forward-fill to handle intermittent missing data
+        return df
+    except Exception as e:
+        st.error(f"Error loading or processing file: {e}")
         return None
-        
-    df['Date'] = pd.to_datetime(df['Date'], dayfirst=True) # Assumes DD-MM-YYYY format, common in India
-    df = df.set_index('Date')
+
+# --- Calculation Functions ---
+
+def calculate_performance_metrics(returns_series, risk_free_rate=0.0):
+    """Calculates key performance metrics from a daily returns series."""
+    if returns_series.empty:
+        return {
+            "Final Value": 10000, "CAGR (%)": 0, "Annualized Volatility (%)": 0,
+            "Sharpe Ratio": 0, "Max Drawdown (%)": 0
+        }
     
-    # Ensure all data is numeric, forward-fill any missing values
-    for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df = df.ffill().dropna()
-    return df
+    # Cumulative return and final value
+    initial_capital = 10000
+    equity_curve = (1 + returns_series).cumprod() * initial_capital
 
-# --- Manual Calculation Functions ---
+    # CAGR
+    total_days = len(returns_series)
+    years = total_days / 252  # Approximate trading days in a year
+    cagr = (equity_curve.iloc[-1] / initial_capital) ** (1 / years) - 1 if years > 0 else 0
 
-def calculate_momentum(df, lookback_period):
-    """
-    MANUAL Calculation of momentum (percentage change).
-    Avoids using df.pct_change() to show the manual logic.
-    """
-    # Shift the dataframe by the lookback period to get the price 'n' days ago
-    shifted_df = df.shift(lookback_period)
-    # Momentum = (Current Price - Shifted Price) / Shifted Price
-    momentum = (df - shifted_df) / shifted_df
-    return momentum.dropna()
+    # Annualized Volatility
+    volatility = returns_series.std() * np.sqrt(252)
 
-def get_rankings(momentum_df):
-    """
-    Ranks the assets based on their momentum scores for each day.
-    Rank 1 is the best performing asset.
-    """
-    # axis=1 ranks across the columns (sectors) for each row (date)
-    # ascending=False makes higher momentum get a lower rank number (e.g., Rank 1)
-    return momentum_df.rank(axis=1, ascending=False, method='first')
+    # Sharpe Ratio
+    sharpe_ratio = (cagr - risk_free_rate) / volatility if volatility != 0 else 0
 
-def run_backtest(price_df, benchmark_col, lookback_period, top_n, use_cash_rule):
-    """
-    The core function to run the entire backtest and generate results.
-    """
-    # 1. Calculate Momentum and Ranks
-    momentum = calculate_momentum(price_df, lookback_period)
-    ranks = get_rankings(momentum)
+    # Max Drawdown
+    cum_max = equity_curve.cummax()
+    drawdown = (equity_curve - cum_max) / cum_max
+    max_drawdown = drawdown.min()
 
-    # Align dataframes to the same date range (starting after the first lookback period)
-    aligned_prices = price_df.loc[ranks.index]
-    
-    # 2. Generate Trading Signals (Holdings)
+    return {
+        "Final Value": f"₹{equity_curve.iloc[-1]:,.2f}",
+        "CAGR (%)": f"{cagr * 100:.2f}",
+        "Annualized Volatility (%)": f"{volatility * 100:.2f}",
+        "Sharpe Ratio": f"{sharpe_ratio:.2f}",
+        "Max Drawdown (%)": f"{max_drawdown * 100:.2f}"
+    }
+
+def run_backtest(price_df, benchmark_col, lookback_period, top_n, use_cash_rule, sma_period):
+    """The core function to run the entire backtest."""
+    # 1. Calculate Momentum and Ranks for the given universe
+    momentum = price_df.pct_change(lookback_period).dropna()
+    ranks = momentum.rank(axis=1, ascending=False, method='first')
+
+    # 2. Calculate Long-term SMA for the benchmark (for our hybrid cash rule)
+    benchmark_sma = price_df[benchmark_col].rolling(window=sma_period).mean()
+
+    # Align all dataframes to a common start date
+    common_index = momentum.index.intersection(benchmark_sma.index)
+    momentum, ranks, benchmark_sma = momentum.loc[common_index], ranks.loc[common_index], benchmark_sma.loc[common_index]
+
+    # 3. Generate Holdings Signals
     positions = pd.DataFrame(index=ranks.index, columns=price_df.columns).fillna(0)
-    
-    # Identify rebalancing dates (first trading day of each month)
     rebalance_dates = ranks.resample('M').first().index
-
     last_positions = pd.Series(0, index=price_df.columns)
 
     for date in ranks.index:
         if date in rebalance_dates:
-            # --- Rebalancing Logic ---
             current_ranks = ranks.loc[date]
+            invest_decision = True
             
-            # --- Cash Rule Application ---
-            invest_decision = True # Assume we invest by default
             if use_cash_rule:
-                benchmark_momentum = momentum.loc[date, benchmark_col]
-                if benchmark_momentum <= 0:
-                    invest_decision = False
+                benchmark_momentum_value = momentum.loc[date, benchmark_col]
+                benchmark_price = price_df.loc[date, benchmark_col]
+                benchmark_sma_value = benchmark_sma.loc[date]
 
+                # HYBRID CASH RULE: Go to cash only if BOTH short and long term trends are negative
+                if benchmark_momentum_value <= 0 and benchmark_price < benchmark_sma_value:
+                    invest_decision = False
+            
             if invest_decision:
-                # Identify which sectors are in the top N
                 top_performers = current_ranks[current_ranks <= top_n].index
                 current_positions = pd.Series(0, index=price_df.columns)
-                current_positions[top_performers] = 1 # We hold these
+                current_positions[top_performers] = 1
             else:
-                # Cash Rule triggered: hold no positions
-                current_positions = pd.Series(0, index=price_df.columns)
-
+                current_positions = pd.Series(0, index=price_df.columns) # Cash position
+            
             last_positions = current_positions
         
         positions.loc[date] = last_positions
 
-    # 3. Calculate Portfolio Returns
-    # Shift positions by 1 day because we trade based on previous day's signal
+    # 4. Calculate Portfolio Returns
     shifted_positions = positions.shift(1).dropna()
-    
-    # Calculate daily returns of all assets
     daily_returns = price_df.pct_change().dropna()
     
-    # Align all dataframes to the same index
     common_index = shifted_positions.index.intersection(daily_returns.index)
-    shifted_positions = shifted_positions.loc[common_index]
-    daily_returns = daily_returns.loc[common_index]
+    shifted_positions, daily_returns = shifted_positions.loc[common_index], daily_returns.loc[common_index]
 
-    # Calculate strategy daily return
-    # The return is the sum of returns of the assets we hold
     portfolio_daily_returns = (daily_returns * shifted_positions).sum(axis=1)
-    
-    # Divide by the number of positions held to get the average return
     num_positions = shifted_positions.sum(axis=1)
-    portfolio_daily_returns = portfolio_daily_returns / num_positions.replace(0, 1) # Avoid division by zero on cash days
+    portfolio_daily_returns = portfolio_daily_returns / num_positions.replace(0, 1)
 
-    # 4. Calculate Cumulative Returns (Equity Curve)
-    initial_capital = 10000
-    portfolio_cumulative = (1 + portfolio_daily_returns).cumprod() * initial_capital
-    
-    # Benchmark performance
-    benchmark_returns = daily_returns[benchmark_col]
-    benchmark_cumulative = (1 + benchmark_returns).cumprod() * initial_capital
-    
-    # Add a starting point to the series for charting
-    start_date = portfolio_cumulative.index[0] - pd.Timedelta(days=1)
-    portfolio_cumulative[start_date] = initial_capital
-    benchmark_cumulative[start_date] = initial_capital
-    portfolio_cumulative = portfolio_cumulative.sort_index()
-    benchmark_cumulative = benchmark_cumulative.sort_index()
+    benchmark_daily_returns = daily_returns.loc[portfolio_daily_returns.index, benchmark_col]
 
-    return portfolio_cumulative, benchmark_cumulative, momentum, ranks, positions, portfolio_daily_returns
+    return portfolio_daily_returns, benchmark_daily_returns, momentum, ranks, positions
 
 # --- Streamlit UI ---
 
-st.title("📈 Sector Rotation Momentum Strategy Backtester")
+st.title("🚀 Advanced Sector Rotation Momentum Backtester")
 
-# --- Sidebar for User Inputs ---
-st.sidebar.header("Strategy Parameters")
-# CORRECTED: Changed type to 'xlsx' and updated the label text
+# --- Sidebar ---
+st.sidebar.header("1. Upload Data")
 uploaded_file = st.sidebar.file_uploader("Upload your XLSX data file", type="xlsx")
 
 if uploaded_file is not None:
     data = load_data(uploaded_file)
     
     if data is not None:
-        sector_cols = [col for col in data.columns]
-        benchmark_col = st.sidebar.selectbox("Select Benchmark Column", data.columns, index=len(data.columns)-1)
-        
-        # User-defined parameters
-        lookback_period = st.sidebar.number_input("Momentum Lookback Period (days)", min_value=5, max_value=252, value=21, step=1)
-        top_n = st.sidebar.number_input("Number of Top Sectors to Hold", min_value=1, max_value=len(sector_cols)-1, value=2, step=1)
-        use_cash_rule = st.sidebar.radio("Use Cash Rule (Absolute Momentum Filter)?", ("Yes", "No")) == "Yes"
-        
-        st.sidebar.markdown("""
-        **Strategy Rules:**
-        1.  **Rebalance:** First trading day of the month.
-        2.  **Selection:** Ranks sectors by `N`-day momentum.
-        3.  **Entry:** Invests in the `Top N` ranked sectors.
-        4.  **Cash Rule (if 'Yes'):** Only invests if the benchmark's own momentum is positive. Otherwise, holds cash.
-        """)
+        st.sidebar.header("2. Set Backtest Period")
+        start_date = st.sidebar.date_input("Start Date", data.index.min(), min_value=data.index.min(), max_value=data.index.max())
+        end_date = st.sidebar.date_input("End Date", data.index.max(), min_value=data.index.min(), max_value=data.index.max())
 
-        # --- Run Strategy & Display Results ---
-        if st.sidebar.button("🚀 Run Backtest"):
-            # Run the core logic
-            strategy_eq, bench_eq, momentum, ranks, positions, strategy_returns = run_backtest(
-                data, benchmark_col, lookback_period, top_n, use_cash_rule
-            )
+        if start_date > end_date:
+            st.sidebar.error("Error: Start date must be before end date.")
+        else:
+            # Filter data based on selected dates and drop any columns that have NaNs in this period
+            data_filtered = data.loc[start_date:end_date].dropna(axis=1)
+            st.sidebar.info(f"Using {len(data_filtered.columns)} sectors with full data in the selected period.")
 
-            # --- Tabbed Interface ---
-            tab1, tab2, tab3 = st.tabs(["📊 Backtest Performance", "📋 Current & Historical Holdings", "🔢 Detailed Returns"])
+            st.sidebar.header("3. Configure Strategy")
+            benchmark_col = st.sidebar.selectbox("Select Benchmark Column", data_filtered.columns, index=len(data_filtered.columns)-1)
+            lookback_period = st.sidebar.slider("Momentum Lookback (days)", 5, 252, 21, 1)
+            top_n = st.sidebar.slider("Number of Sectors to Hold", 1, max(1, len(data_filtered.columns)-1), 2, 1)
+            
+            use_cash_rule = st.sidebar.checkbox("Use Hybrid Cash Rule?", value=True)
+            sma_period = st.sidebar.slider("Long-term SMA for Cash Rule (days)", 50, 252, 210, 10, disabled=not use_cash_rule)
+            
+            st.sidebar.markdown("""
+            ---
+            **Hybrid Cash Rule:** If checked, the strategy holds cash unless the benchmark's 1-month momentum is positive **OR** its price is above the long-term SMA.
+            """)
 
-            with tab1:
-                st.header("Performance Chart")
+            if st.sidebar.button("Run Backtest", type="primary"):
+                # Run the backtest
+                strategy_returns, bench_returns, momentum, ranks, positions = run_backtest(
+                    data_filtered, benchmark_col, lookback_period, top_n, use_cash_rule, sma_period
+                )
+
+                # --- Main Page Display ---
+                st.header("📈 Performance Dashboard")
+
+                # Calculate metrics
+                strategy_metrics = calculate_performance_metrics(strategy_returns)
+                benchmark_metrics = calculate_performance_metrics(bench_returns)
+
+                metrics_df = pd.DataFrame([strategy_metrics, benchmark_metrics], index=["Strategy", "Benchmark"])
+                st.dataframe(metrics_df, use_container_width=True)
+
+                # Equity Curve
+                strategy_eq = (1 + strategy_returns).cumprod() * 10000
+                bench_eq = (1 + bench_returns).cumprod() * 10000
                 
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(x=strategy_eq.index, y=strategy_eq, mode='lines', name='Strategy', line=dict(color='blue', width=2)))
+                fig.add_trace(go.Scatter(x=strategy_eq.index, y=strategy_eq, mode='lines', name='Strategy', line=dict(color='royalblue', width=2)))
                 fig.add_trace(go.Scatter(x=bench_eq.index, y=bench_eq, mode='lines', name='Benchmark', line=dict(color='grey', width=2, dash='dash')))
-                fig.update_layout(
-                    title='Strategy vs. Benchmark Equity Curve',
-                    xaxis_title='Date',
-                    yaxis_title='Portfolio Value',
-                    legend_title='Legend',
-                    yaxis_tickprefix='₹',
-                    font=dict(family="Arial, sans-serif", size=12)
-                )
+                fig.update_layout(title='Strategy vs. Benchmark Equity Curve', yaxis_title='Portfolio Value (Log Scale)', yaxis_type="log")
                 st.plotly_chart(fig, use_container_width=True)
+                
+                # --- Tabbed Interface for Details ---
+                tab1, tab2, tab3 = st.tabs(["Monthly Returns", "Current Standings", "Historical Holdings"])
 
-                # Performance Metrics
-                st.header("Key Performance Metrics")
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Strategy Final Value", f"₹{strategy_eq.iloc[-1]:,.2f}")
-                col2.metric("Benchmark Final Value", f"₹{bench_eq.iloc[-1]:,.2f}")
-                
-                def calculate_max_drawdown(series):
-                    cum_max = series.cummax()
-                    drawdown = (series - cum_max) / cum_max
-                    return drawdown.min() * 100
+                with tab1:
+                    st.header("Monthly Returns Comparison (%)")
+                    # Strategy
+                    strat_monthly = strategy_returns.resample('M').apply(lambda x: (1 + x).prod() - 1)
+                    # Benchmark
+                    bench_monthly = bench_returns.resample('M').apply(lambda x: (1 + x).prod() - 1)
+                    
+                    monthly_df = pd.DataFrame({
+                        'Strategy': strat_monthly * 100,
+                        'Benchmark': bench_monthly * 100,
+                    })
+                    monthly_df['Outperformance'] = monthly_df['Strategy'] - monthly_df['Benchmark']
+                    monthly_df.index = monthly_df.index.strftime('%Y-%b')
 
-                strategy_dd = calculate_max_drawdown(strategy_eq)
-                col3.metric("Strategy Max Drawdown", f"{strategy_dd:.2f}%")
+                    st.dataframe(monthly_df.style.format("{:.2f}").background_gradient(
+                        cmap='RdYlGn', subset=['Strategy', 'Benchmark', 'Outperformance']
+                    ), use_container_width=True)
 
-            with tab2:
-                st.header(f"Current Sector Momentum ({lookback_period}-day)")
-                st.write(f"As of {momentum.index[-1].strftime('%d-%b-%Y')}")
-                
-                current_snapshot = pd.DataFrame({
-                    'Momentum (%)': momentum.iloc[-1] * 100,
-                    'Rank': ranks.iloc[-1]
-                }).sort_values('Rank')
-                st.dataframe(current_snapshot.style.format({'Momentum (%)': '{:.2f}'}), use_container_width=True)
-                
-                st.header("Historical Portfolio Allocations")
-                st.write("Showing the portfolio composition on each rebalancing date.")
-                
-                rebalance_dates = positions.resample('M').first().index
-                historical_holdings = positions[positions.index.isin(rebalance_dates) & (positions.diff().abs().sum(axis=1) > 0)]
-                
-                display_holdings = historical_holdings.apply(lambda row: ', '.join(row[row==1].index), axis=1).reset_index()
-                display_holdings.columns = ['Rebalance Date', 'Sectors Held']
-                display_holdings['Sectors Held'] = display_holdings['Sectors Held'].replace('', 'CASH')
-                
-                st.dataframe(display_holdings.set_index('Rebalance Date').sort_index(ascending=False), use_container_width=True)
 
-            with tab3:
-                st.header("Strategy Monthly Returns Heatmap")
-                monthly_returns = strategy_returns.resample('M').apply(lambda x: (1 + x).prod() - 1) * 100
-                monthly_returns_df = monthly_returns.to_frame(name="Return").reset_index()
-                monthly_returns_df['Year'] = monthly_returns_df['Date'].dt.year
-                monthly_returns_df['Month'] = monthly_returns_df['Date'].dt.strftime('%b')
-                
-                monthly_pivot = monthly_returns_df.pivot_table(index='Year', columns='Month', values='Return', aggfunc='sum')
-                month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-                monthly_pivot = monthly_pivot.reindex(columns=month_order)
-                
-                st.dataframe(monthly_pivot.style.format("{:.2f}%").background_gradient(cmap='RdYlGn', axis=None).highlight_null('white'), use_container_width=True)
+                with tab2:
+                    st.header(f"Current Sector Standings ({lookback_period}-day)")
+                    st.write(f"As of {momentum.index[-1].strftime('%d-%b-%Y')}")
+                    
+                    current_snapshot = pd.DataFrame({
+                        'Momentum (%)': momentum.iloc[-1] * 100,
+                        'Rank': ranks.iloc[-1]
+                    }).sort_values('Rank')
+                    st.dataframe(current_snapshot.style.format({'Momentum (%)': '{:.2f}'}), use_container_width=True)
+
+                with tab3:
+                    st.header("Historical Portfolio Allocations")
+                    st.write("Showing the portfolio composition on each rebalancing date.")
+                    rebalance_dates = positions.resample('M').first().index
+                    historical_holdings = positions[positions.index.isin(rebalance_dates) & (positions.diff().abs().sum(axis=1) > 0)]
+                    
+                    display_holdings = historical_holdings.apply(lambda row: ', '.join(row[row==1].index) or 'CASH', axis=1).reset_index()
+                    display_holdings.columns = ['Rebalance Date', 'Sectors Held']
+                    
+                    st.dataframe(display_holdings.set_index('Rebalance Date').sort_index(ascending=False), use_container_width=True)
 
 else:
-    # CORRECTED: Updated instructions for XLSX
-    st.info("Please upload an XLSX file to begin.")
+    st.info("Awaiting upload of an XLSX file...")
+    st.image("https://i.imgur.com/gYf0g39.png", width=600)
     st.markdown("""
-    **Instructions:**
-    1.  Prepare your data in an Excel file.
-    2.  The first column must be named 'Date' (format `DD-MM-YYYY` or `MM-DD-YYYY`).
-    3.  Subsequent columns should have the price data for each sector.
-    4.  The final column should be your benchmark index.
-    5.  Save the file with an `.xlsx` extension.
-    6.  Upload it using the sidebar on the left.
-    7.  Set your strategy parameters and click 'Run Backtest'.
+    **Welcome to the Advanced Sector Rotation Backtester!**
+    1.  Prepare your data in an Excel file (`.xlsx`).
+    2.  The first column must be named `Date`.
+    3.  Subsequent columns for sector/index price data.
+    4.  Upload via the sidebar to begin.
     """)
