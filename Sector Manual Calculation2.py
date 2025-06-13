@@ -13,8 +13,8 @@ st.set_page_config(
 # --- Caching Functions for Performance ---
 @st.cache_data
 def load_data(file):
-    """Loads and preprocesses the data from a CSV file."""
-    df = pd.read_csv(file)
+    """Loads and preprocesses the data from a xlsx file."""
+    df = pd.read_xlsx(file)
     df['Date'] = pd.to_datetime(df['Date'], dayfirst=True) # Use dayfirst=True for DD-MM-YYYY
     df = df.set_index('Date')
     # Ensure all data is numeric, forward-fill any missing values
@@ -132,7 +132,7 @@ st.title("📈 Sector Rotation Momentum Strategy Backtester")
 
 # --- Sidebar for User Inputs ---
 st.sidebar.header("Strategy Parameters")
-uploaded_file = st.sidebar.file_uploader("Upload your CSV data file", type="csv")
+uploaded_file = st.sidebar.file_uploader("Upload your xlsx data file", type="xlsx")
 
 if uploaded_file is not None:
     data = load_data(uploaded_file)
@@ -237,14 +237,14 @@ if uploaded_file is not None:
             st.dataframe(monthly_pivot.style.format("{:.2f}%").background_gradient(cmap='RdYlGn', axis=None).highlight_null(''), use_container_width=True)
 
 else:
-    st.info("Please upload a CSV file to begin.")
+    st.info("Please upload a xlsx file to begin.")
     st.markdown("""
     **Instructions:**
     1.  Prepare your data in Excel or Google Sheets.
     2.  Column A should be 'Date' in `DD-MM-YYYY` or `MM-DD-YYYY` format.
     3.  Subsequent columns should contain the price data for each sector index (e.g., 'Nifty Auto', 'Nifty Bank').
     4.  The last column should be your benchmark (e.g., 'Nifty 50').
-    5.  Save the file as a CSV.
+    5.  Save the file as a xlsx.
     6.  Upload it using the sidebar on the left.
     7.  Set your desired parameters and click 'Run Backtest'.
     """)
