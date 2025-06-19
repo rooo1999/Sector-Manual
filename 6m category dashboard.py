@@ -38,9 +38,13 @@ def fetch_nav(scheme_code):
 def calculate_6m_returns(df, start_date):
     results = []
     current_start = pd.Timestamp(start_date)
-    
+
     while True:
         current_end = current_start + relativedelta(months=6)
+
+        # Ensure we don't exceed available data
+        if current_end > df['date'].max():
+            break
 
         # Filter NAVs
         start_nav = df[df['date'] <= current_start].tail(1)
@@ -50,13 +54,18 @@ def calculate_6m_returns(df, start_date):
             nav_start = start_nav['nav'].values[0]
             nav_end = end_nav['nav'].values[0]
             abs_return = round(((nav_end - nav_start) / nav_start) * 100, 2)
+
+            # Avoid NaT formatting
+            if pd.isna(current_start) or pd.isna(current_end):
+                break
+
             results.append({
                 "Period": f"{current_start.strftime('%d-%b-%Y')} to {current_end.strftime('%d-%b-%Y')}",
                 "6M Return (%)": abs_return
             })
-            current_start = current_end
-        else:
-            break
+
+        current_start = current_end
+
     return results
 
 # Display results
@@ -68,10 +77,14 @@ for code in scheme_codes:
     if nav_df.empty:
         continue
 
-    fund_name = requests.get(f"https://api.mfapi.in/mf/{code}").json().get("meta", {}).get("scheme_name", "Unnamed Fund")
+    try:
+        fund_name = requests.get(f"https://api.mfapi.in/mf/{code}").json().get("meta", {}).get("scheme_name", "Unnamed Fund")
+    except:
+        fund_name = f"Scheme {code}"
 
     returns = calculate_6m_returns(nav_df, pd.Timestamp(start_date))
     returns_df = pd.DataFrame(returns)
+
     if not returns_df.empty:
         st.subheader(f"📌 {fund_name}")
         st.dataframe(returns_df, use_container_width=True)
