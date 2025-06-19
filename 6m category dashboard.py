@@ -37,7 +37,8 @@ def fetch_nav(scheme_code):
 # Calculate absolute 6M return over each 6M period from start_date
 def calculate_6m_returns(df, start_date):
     results = []
-    current_start = start_date
+    current_start = pd.Timestamp(start_date)
+    
     while True:
         current_end = current_start + relativedelta(months=6)
 
@@ -69,7 +70,7 @@ for code in scheme_codes:
 
     fund_name = requests.get(f"https://api.mfapi.in/mf/{code}").json().get("meta", {}).get("scheme_name", "Unnamed Fund")
 
-    returns = calculate_6m_returns(nav_df, pd.to_datetime(start_date))
+    returns = calculate_6m_returns(nav_df, pd.Timestamp(start_date))
     returns_df = pd.DataFrame(returns)
     if not returns_df.empty:
         st.subheader(f"📌 {fund_name}")
