@@ -5,7 +5,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
 st.set_page_config(page_title="6M Returns Since 2015", layout="wide")
-st.title("📈 Mutual Fund 6-Month Returns (Rolling from Custom Start Date)")
+st.title("📈 Mutual Fund 6-Month Returns (End-of-Month Based Periods)")
 
 # Predefined mutual fund scheme codes by category
 scheme_categories = {
@@ -34,59 +34,77 @@ def fetch_nav(scheme_code):
         return df
     return pd.DataFrame()
 
-# Calculate absolute 6M return over each 6M period from start_date
-def calculate_6m_returns(df, start_date):
-    results = []
-    current_start = pd.Timestamp(start_date)
+# Function to get last day of month
+def end_of_month(date):
+    return (date + relativedelta(months=1, day=1)) - pd.Timedelta(days=1)
 
+# Build all 6M periods using "last day of 6th month"
+def get_periods(start_date, end_date):
+    periods = []
+    start = pd.Timestamp(start_date)
     while True:
-        current_end = current_start + relativedelta(months=6)
-
-        # Ensure we don't exceed available data
-        if current_end > df['date'].max():
+        six_months_later = start + relativedelta(months=6)
+        end = end_of_month(six_months_later)
+        if end > end_date:
             break
+        periods.append((start, end))
+        start = end  # move to end of last period
+    return periods
 
-        # Filter NAVs
-        start_nav = df[df['date'] <= current_start].tail(1)
-        end_nav = df[df['date'] <= current_end].tail(1)
+# Function to get return
+def get_return(df, start, end):
+    if df.empty:
+        return None
+    start_nav = df[df['date'] <= start].tail(1)
+    end_nav = df[df['date'] <= end].tail(1)
+    if not start_nav.empty and not end_nav.empty:
+        nav_start = start_nav['nav'].values[0]
+        nav_end = end_nav['nav'].values[0]
+        return round(((nav_end - nav_start) / nav_start) * 100, 2)
+    return None
 
-        if not start_nav.empty and not end_nav.empty:
-            nav_start = start_nav['nav'].values[0]
-            nav_end = end_nav['nav'].values[0]
-            abs_return = round(((nav_end - nav_start) / nav_start) * 100, 2)
-
-            # Avoid NaT formatting
-            if pd.isna(current_start) or pd.isna(current_end):
-                break
-
-            results.append({
-                "Period": f"{current_start.strftime('%d-%b-%Y')} to {current_end.strftime('%d-%b-%Y')}",
-                "6M Return (%)": abs_return
-            })
-
-        current_start = current_end
-
-    return results
-
-# Display results
-st.write(f"### 6-Month Returns for {selected_category} Funds")
+# Main logic
 scheme_codes = scheme_categories[selected_category]
+all_returns = {}
+period_labels = []
 
+# Get the global common max date across all schemes
+latest_end_dates = []
+for code in scheme_codes:
+    nav_df = fetch_nav(code)
+    if not nav_df.empty:
+        latest_end_dates.append(nav_df['date'].max())
+
+global_end = min(latest_end_dates) if latest_end_dates else datetime.today()
+periods = get_periods(start_date, global_end)
+period_labels = [f"{s.strftime('%d-%b-%Y')} to {e.strftime('%d-%b-%Y')}" for s, e in periods]
+
+# For each scheme
 for code in scheme_codes:
     nav_df = fetch_nav(code)
     if nav_df.empty:
         continue
 
     try:
-        fund_name = requests.get(f"https://api.mfapi.in/mf/{code}").json().get("meta", {}).get("scheme_name", "Unnamed Fund")
+        fund_name = requests.get(f"https://api.mfapi.in/mf/{code}").json().get("meta", {}).get("scheme_name", f"Scheme {code}")
     except:
         fund_name = f"Scheme {code}"
 
-    returns = calculate_6m_returns(nav_df, pd.Timestamp(start_date))
-    returns_df = pd.DataFrame(returns)
+    fund_returns = []
+    for start, end in periods:
+        r = get_return(nav_df, start, end)
+        fund_returns.append(r)
 
-    if not returns_df.empty:
-        st.subheader(f"📌 {fund_name}")
-        st.dataframe(returns_df, use_container_width=True)
-    else:
-        st.warning(f"No return data available for {fund_name}")
+    all_returns[fund_name] = fund_returns
+
+# Combine into one table
+returns_df = pd.DataFrame(all_returns, index=period_labels).T
+returns_df.index.name = "Fund"
+returns_df.columns.name = "6M Periods"
+
+# Show
+if not returns_df.empty:
+    st.write(f"### Combined 6-Month Returns Table for {selected_category}")
+    st.dataframe(returns_df, use_container_width=True)
+else:
+    st.warning("No data available for the selected category.")
