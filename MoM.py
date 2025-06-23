@@ -38,35 +38,7 @@ def calculate_mom_returns(nav_df):
     return nav_df[['month', 'return']].iloc[1:]  # Skip first NaN return
 
 # ---- User input ----
-default_codes = "105804,
-125350,
-147944,
-145677,
-152130,
-146127,
-105989,
-146193,
-103360,
-130502,
-108097,
-106823,
-145139,
-147920,
-152612,
-152003,
-150912,
-153198,
-152232,
-113177,
-149020,
-100177,
-152108,
-125494,
-100795,
-145208,
-152940,
-129647,
-148617, "
+default_codes = "105804, 125350, 147944, 145677, 152130, 146127, 105989, 146193, 103360, 130502, 108097, 106823, 145139, 147920, 152612, 152003, 150912, 153198, 152232, 113177, 149020, 100177, 152108, 125494, 100795, 145208, 152940, 129647, 148617,"
 scheme_codes_input = st.text_input("Enter scheme codes (comma-separated):", default_codes)
 scheme_codes = [code.strip() for code in scheme_codes_input.split(',') if code.strip().isdigit()]
 
