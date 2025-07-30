@@ -197,8 +197,8 @@ if run_button:
         st.stop()
 
     BENCHMARKS = {
-        "Nifty 50 TRI": "120716", "Nifty 500 TRI": "153161", "Smallcap 250 TRI": "153233",
-        "Midcap 150 TRI": "150673", "Sensex TRI": "149803"
+        "Nifty 50 TRI": "147794", "Nifty 500 TRI": "147625", "Smallcap 250 TRI": "147623",
+        "Midcap 150 TRI": "147622", "Sensex TRI": "119597"
     }
     excel_cmap = LinearSegmentedColormap.from_list("excel_like", ["#f8696b", "#ffeb84", "#63be7b"])
 
