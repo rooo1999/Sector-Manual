@@ -8,4 +8,5 @@ plotly
 openpyxl
 setuptools
 numpy
+pandas_ta
 mftool
