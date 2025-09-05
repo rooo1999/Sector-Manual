@@ -7,6 +7,6 @@ seaborn
 plotly
 openpyxl
 setuptools
-numpy
+numpy<2.0
 pandas_ta
 mftool
