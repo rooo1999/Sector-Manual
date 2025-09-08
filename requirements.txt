@@ -1,12 +1,12 @@
 streamlit
-pandas==2.1.4
+pandas
 requests
 python-dateutil
-matplotlib==3.8.4
+matplotlib
 seaborn
 plotly
 openpyxl
 setuptools
-numpy==1.26.4
-pandas_ta==0.3.14b0
+numpy
+pandas_ta
 mftool
