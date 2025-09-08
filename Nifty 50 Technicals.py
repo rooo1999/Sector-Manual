@@ -46,11 +46,17 @@ strategy_mode = st.sidebar.selectbox(
 st.sidebar.subheader('Indicator Parameters')
 ema_short = st.sidebar.number_input('Short EMA Period', 1, 200, 21)
 ema_long = st.sidebar.number_input('Long EMA Period', 1, 200, 50)
+
+# --- Added Validation ---
+if ema_short >= ema_long:
+    st.sidebar.warning(f"Warning: Short EMA ({ema_short}) should be less than Long EMA ({ema_long}).")
+
 sma_regime = st.sidebar.number_input('Regime SMA Period', 50, 400, 200)
 adx_threshold = st.sidebar.slider('ADX Trend Threshold', 0, 100, 25)
 atr_period = st.sidebar.number_input('ATR Period', 1, 50, 14)
 atr_multiplier = st.sidebar.number_input('ATR Trailing Stop Multiplier', 1.0, 5.0, 2.5, 0.1)
 atr_breathing_room_multiplier = st.sidebar.number_input('ATR Breathing Room Multiplier', 1.0, 5.0, 2.5, 0.1)
+
 
 # --- Backtest Parameters ---
 st.sidebar.subheader('Backtest Parameters')
@@ -78,11 +84,9 @@ CONFIG = {
 # 2. HELPER & CORE LOGIC FUNCTIONS (with Streamlit Caching)
 # ==============================================================================
 
-# Use st.cache_data to avoid re-downloading data on every interaction
 @st.cache_data
 def fetch_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     """Fetches historical market data, ensuring a single-level column index."""
-    # Fetch an extra year of data to ensure indicators are fully calculated
     start_dt = datetime.strptime(start, '%Y-%m-%d') - timedelta(days=365)
     data = yf.download(ticker, start=start_dt.strftime('%Y-%m-%d'), end=end, interval='1d', auto_adjust=True)
     if data.empty: return None
@@ -97,39 +101,47 @@ def calculate_indicators(_df: pd.DataFrame, config: dict) -> pd.DataFrame:
     df.ta.ema(length=config['ema_short'], append=True, col_names=('EMA_short',))
     df.ta.ema(length=config['ema_long'], append=True, col_names=('EMA_long',))
     df.ta.sma(length=config['sma_regime'], append=True, col_names=('SMA_regime',))
-    df.ta.adx(length=config['atr_period'], append=True, col_names=('ADX', 'DMP', 'DMN'))
+    
+    # FIXED: Removed col_names from adx() to let pandas-ta use its default naming (e.g., ADX_14)
+    # This is necessary for newer versions of the library.
+    df.ta.adx(length=config['atr_period'], append=True)
+    
     df.ta.atr(length=config['atr_period'], append=True, col_names=('ATR',))
     df['ema_cross_up'] = ta.cross(df['EMA_short'], df['EMA_long'], above=True)
     df['ema_cross_down'] = ta.cross(df['EMA_short'], df['EMA_long'], above=False)
     
-    # Trim data back to the user-specified start date after indicators are calculated
     df = df[df.index >= pd.to_datetime(config['start_date'])]
     df.dropna(inplace=True)
     return df
 
-# The following functions are complex and depend on every parameter, so we don't cache them.
-# The data fetching and indicator calculation are the slow parts, which are now cached.
 def generate_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     """Generates initial entry signals based on the selected strategy mode."""
     mode = config['strategy_mode']
     entry_condition = pd.Series(False, index=df.index)
+    
+    # FIXED: Dynamically create the ADX column name to match pandas-ta's default output (e.g., 'ADX_14')
+    adx_col_name = f"ADX_{config['atr_period']}"
+    
+    if adx_col_name not in df.columns:
+        st.error(f"Technical Error: The ADX column '{adx_col_name}' was not found in the data. The backtest cannot proceed.")
+        st.stop()
 
     if mode == 'ema_cross':
         entry_condition = df['ema_cross_up'] == 1
     
     elif mode in ['ema_adx', 'ema_atr_exit']:
-        strong_trend = df['ADX'] > config['adx_threshold']
+        strong_trend = df[adx_col_name] > config['adx_threshold']
         entry_condition = (df['ema_cross_up'] == 1) & strong_trend
     
     elif mode == 'regime_filter':
         is_bull_regime = df['Close'] > df['SMA_regime']
-        tactical_entry_condition = (df['ema_cross_up'] == 1) & (df['ADX'] > config['adx_threshold'])
+        tactical_entry_condition = (df['ema_cross_up'] == 1) & (df[adx_col_name] > config['adx_threshold'])
         enter_bull_regime = is_bull_regime & ~is_bull_regime.shift(1).fillna(False)
         entry_condition = np.where(is_bull_regime, enter_bull_regime, tactical_entry_condition)
         
     elif mode == 'regime_pullback':
         is_bull_regime = df['Close'] > df['SMA_regime']
-        trend_is_up = (df['EMA_short'] > df['EMA_long']) & (df['ADX'] > config['adx_threshold'])
+        trend_is_up = (df['EMA_short'] > df['EMA_long']) & (df[adx_col_name] > config['adx_threshold'])
         price_pulls_back_and_recovers = ta.cross(df['Close'], df['EMA_short'], above=True) == 1
         tactical_entry_condition = trend_is_up & price_pulls_back_and_recovers
         enter_bull_regime = is_bull_regime & ~is_bull_regime.shift(1).fillna(False)
@@ -253,7 +265,6 @@ def get_daily_signal(df: pd.DataFrame, config: dict) -> (str, str, str):
     reason = ""
     color = "orange"
 
-    # Check for an exit signal first
     was_in_position = prev_row['position'] == 1
     if was_in_position:
         is_bull_regime_today = last_row['Close'] > last_row['SMA_regime']
@@ -269,7 +280,6 @@ def get_daily_signal(df: pd.DataFrame, config: dict) -> (str, str, str):
             reason = "Continue holding the existing position."
             color = "green"
     
-    # If no exit, check for an entry signal
     was_in_cash = prev_row['position'] == 0
     if was_in_cash and last_row['entry_signal'] == 1:
         signal = "BUY"
@@ -289,7 +299,6 @@ def get_daily_signal(df: pd.DataFrame, config: dict) -> (str, str, str):
 def plot_equity_curve_and_drawdown(df: pd.DataFrame, metrics: dict):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
     
-    # Equity Curve
     ax1.plot(df.index, df['cumulative_market_returns'], label='Buy and Hold', color='blue')
     ax1.plot(df.index, df['cumulative_strategy_returns'], label=f'Strategy ({CONFIG["strategy_mode"]})', color='green')
     ax1.set_title('Strategy Performance vs. Buy and Hold', fontsize=16)
@@ -297,7 +306,6 @@ def plot_equity_curve_and_drawdown(df: pd.DataFrame, metrics: dict):
     ax1.legend(loc='upper left')
     ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
 
-    # Drawdown
     ax2.fill_between(df.index, df['drawdown_strategy'], 0, color='red', alpha=0.3)
     ax2.plot(df.index, df['drawdown_strategy'], color='red', linewidth=1)
     ax2.set_title('Strategy Drawdown', fontsize=16)
@@ -336,20 +344,16 @@ def plot_price_and_signals(df: pd.DataFrame, config: dict):
 st.title(f'📈 {ticker} Trading Strategy Dashboard')
 st.markdown(f"**Strategy Mode:** `{CONFIG['strategy_mode']}` | **Date Range:** `{CONFIG['start_date']}` to `{CONFIG['end_date']}`")
 
-# --- Run the full pipeline ---
 raw_data = fetch_data(CONFIG['ticker'], CONFIG['start_date'], CONFIG['end_date'])
 
 if raw_data is not None and not raw_data.empty:
     data_with_indicators = calculate_indicators(raw_data.copy(), CONFIG)
     data_with_signals = generate_signals(data_with_indicators.copy(), CONFIG)
     
-    # Note: Only iterative backtest is supported for advanced strategies
     results_df, trades_list = run_iterative_backtest(data_with_signals.copy(), CONFIG)
     
-    # --- DAILY SIGNAL SECTION ---
     st.header("Today's Signal")
     
-    # Get the latest price for display
     latest_price = raw_data['Close'].iloc[-1]
     price_change = latest_price - raw_data['Close'].iloc[-2]
     
@@ -370,21 +374,18 @@ if raw_data is not None and not raw_data.empty:
 
     st.markdown("---")
     
-    # --- BACKTEST RESULTS SECTION ---
     st.header("Backtest Performance Analysis")
 
     if not results_df.empty:
         benchmark_returns = raw_data['Close'].pct_change()
         final_df, metrics = finalize_and_calculate_metrics(results_df, benchmark_returns)
         
-        # --- Performance Metrics ---
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Strategy CAGR", f"{metrics.get('cagr_strategy', 0):.2f}%")
         col2.metric("Benchmark CAGR", f"{metrics.get('cagr_market', 0):.2f}%")
         col3.metric("Strategy Max Drawdown", f"{metrics.get('max_drawdown_strategy', 0):.2f}%")
         col4.metric("Benchmark Max Drawdown", f"{metrics.get('max_drawdown_market', 0):.2f}%")
 
-        # --- Charting and Trade Logs in Tabs ---
         tab1, tab2, tab3, tab4 = st.tabs(["Equity Curve & Drawdown", "Price Chart & Signals", "Trade Log", "Yearly Returns"])
 
         with tab1:
@@ -403,7 +404,6 @@ if raw_data is not None and not raw_data.empty:
                     'Return Pct': '{:.2f}%'
                 }))
 
-                # Trade Analytics
                 st.subheader("Trade Analytics")
                 win_rate = (trades_df['Return Pct'] > 0).mean() * 100
                 avg_win = trades_df[trades_df['Return Pct'] > 0]['Return Pct'].mean()
@@ -412,7 +412,7 @@ if raw_data is not None and not raw_data.empty:
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Total Trades", f"{len(trades_df)}")
                 c2.metric("Win Rate", f"{win_rate:.2f}%")
-                c3.metric("Payoff Ratio", f"{abs(avg_win / avg_loss) if avg_loss != 0 else '∞':.2f}")
+                c3.metric("Payoff Ratio", f"{abs(avg_win / avg_loss) if avg_loss != 0 and not np.isnan(avg_loss) else '∞':.2f}")
                 c4.metric("Avg Holding Period", f"{trades_df['Holding Period'].mean():.1f} days")
             else:
                 st.info("No trades were executed in this backtest.")
