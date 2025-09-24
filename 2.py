@@ -288,9 +288,27 @@ if run_button:
     with tabs[0]:
         st.header("Overall Portfolio Comparison")
         st.subheader("Trailing Returns Comparison")
-        comparison_data = {name: (res['fund_trailing_returns'].T * res['allocations'].iloc[:, -1]).sum(axis=1) for name, res in portfolio_results.items()}
-        comparison_df = pd.DataFrame(comparison_data).T
-        st.dataframe(style_table(comparison_df.style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
+
+        # --- START: MODIFIED/CORRECTED CODE ---
+        # The original method was mathematically incorrect. A portfolio's compounded return is NOT
+        # the weighted average of its components' compounded returns.
+        # The correct method is to calculate returns from the portfolio's daily value index,
+        # which is exactly what is done in the individual portfolio tabs. We replicate that here.
+        
+        comparison_trailing_returns = {}
+        for name, res in portfolio_results.items():
+            # Calculate trailing returns directly from the portfolio's daily value series
+            portfolio_trailing = calculate_trailing_returns(res['daily_value_index'])
+            comparison_trailing_returns[name] = portfolio_trailing
+        
+        comparison_df = pd.DataFrame(comparison_trailing_returns).T
+        
+        # Ensure consistent column order with other tables
+        cols_order = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year', '3 Years', '5 Years']
+        final_cols_comparison = [c for c in cols_order if c in comparison_df.columns]
+        
+        st.dataframe(style_table(comparison_df[final_cols_comparison].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
+        # --- END: MODIFIED/CORRECTED CODE ---
 
         st.subheader("Portfolio Value Growth Comparison")
         growth_df = pd.concat({name: res['daily_value_index'] for name, res in portfolio_results.items()}, axis=1)
