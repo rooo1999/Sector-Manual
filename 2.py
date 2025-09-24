@@ -29,11 +29,15 @@ TRAILING_COLS_ORDER = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year'
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 
 # --- Helper Functions ---
-@st.cache_data
-def read_all_portfolios(uploaded_file):
-    """Reads all sheets from an Excel file and cleans them up to be portfolio allocation DataFrames."""
+
+# MODIFIED: New function to read from a public Google Sheet
+@st.cache_data(ttl="1h", show_spinner="Loading portfolio allocation data...")
+def read_portfolios_from_google_sheet(sheet_id):
+    """Reads all sheets from a public Google Sheet and cleans them up."""
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
     try:
-        all_sheets = pd.read_excel(uploaded_file, sheet_name=None, engine='openpyxl', dtype={0: str})
+        # The logic inside is identical to the old function, just the source changes.
+        all_sheets = pd.read_excel(url, sheet_name=None, engine='openpyxl', dtype={0: str})
         cleaned_portfolios = {}
         for sheet_name, df in all_sheets.items():
             df = df.dropna(how='all').dropna(how='all', axis=1)
@@ -50,7 +54,7 @@ def read_all_portfolios(uploaded_file):
                 cleaned_portfolios[sheet_name] = df
         return cleaned_portfolios
     except Exception as e:
-        st.error(f"Error reading Excel file: {e}")
+        st.error(f"Error reading from Google Sheet. Please ensure the Sheet ID is correct and the sheet is public ('Anyone with the link'). Error: {e}")
         return {}
 
 @st.cache_data(ttl="6h")
@@ -161,36 +165,48 @@ def style_table(styler, format_str, na_rep, cmap, weight_col=None):
 
 # --- Main App ---
 st.title("🚀 Comprehensive Portfolio Performance Dashboard")
-st.markdown("Analyse portfolio performance using periodic returns from your file and **up-to-date trailing returns** from live market data.")
+st.markdown("Analyse portfolio performance using periodic returns from a live data source and **up-to-date trailing returns** from market data.")
+
+# --- Data Loading ---
+all_portfolios_data_original = None
+all_navs_df = None
+
+try:
+    # Use the new function with the ID from secrets
+    google_sheet_id = st.secrets["GOOGLE_SHEET_ID"]
+    all_portfolios_data_original = read_portfolios_from_google_sheet(google_sheet_id)
+except KeyError:
+    st.error("`GOOGLE_SHEET_ID` not found in Streamlit secrets. Please add it to your `.streamlit/secrets.toml` file.")
+    st.stop()
+except Exception as e:
+    st.error(f"An unexpected error occurred during data loading: {e}")
+    st.stop()
+
+if all_portfolios_data_original:
+    with st.spinner("Fetching market data..."):
+        all_fund_codes = set(code for p in all_portfolios_data_original.values() for code in p.index)
+        all_scheme_codes = tuple(all_fund_codes | set(BENCHMARKS.values()))
+        
+        full_nav_history = _fetch_full_nav_history(all_scheme_codes)
+        all_navs_df = pd.DataFrame(full_nav_history).ffill().bfill()
+else:
+    st.warning("No portfolio data was loaded from the Google Sheet. Please check the sheet's format and sharing settings.")
+    st.stop()
 
 # --- Sidebar Controls ---
 with st.sidebar:
     st.header("⚙️ Controls")
-    uploaded_file = st.file_uploader("1. Upload Portfolio Excel File", type=['xlsx'])
-    initial_investment = st.number_input("2. Initial Investment", min_value=1.0, value=10000.0, step=1000.0)
+    initial_investment = st.number_input("1. Initial Investment", min_value=1.0, value=10000.0, step=1000.0)
 
     start_date, end_date = None, None
-    all_portfolios_data_original = None
-    all_navs_df = None
-
-    if uploaded_file:
-        with st.spinner("Reading file and fetching market data..."):
-            all_portfolios_data_original = read_all_portfolios(uploaded_file)
-            if all_portfolios_data_original:
-                all_fund_codes = set(code for p in all_portfolios_data_original.values() for code in p.index)
-                all_scheme_codes = tuple(all_fund_codes | set(BENCHMARKS.values()))
-                
-                full_nav_history = _fetch_full_nav_history(all_scheme_codes)
-                all_navs_df = pd.DataFrame(full_nav_history).ffill().bfill()
-
-                if not all_navs_df.empty:
-                    api_min_date = all_navs_df.index.min().date()
-                    api_max_date = all_navs_df.index.max().date()
-                    
-                    st.markdown("---")
-                    st.header("3. Set Date Range")
-                    start_date = st.date_input("Analysis Start Date", value=api_min_date, min_value=api_min_date, max_value=api_max_date)
-                    end_date = st.date_input("Analysis End Date", value=api_max_date, min_value=api_min_date, max_value=api_max_date)
+    if not all_navs_df.empty:
+        api_min_date = all_navs_df.index.min().date()
+        api_max_date = all_navs_df.index.max().date()
+        
+        st.markdown("---")
+        st.header("2. Set Date Range")
+        start_date = st.date_input("Analysis Start Date", value=api_min_date, min_value=api_min_date, max_value=api_max_date)
+        end_date = st.date_input("Analysis End Date", value=api_max_date, min_value=api_min_date, max_value=api_max_date)
 
     st.markdown("---")
     run_button = st.button("📊 Run Analysis", type="primary", use_container_width=True, disabled=(not start_date))
@@ -198,7 +214,7 @@ with st.sidebar:
 # --- Main Execution Block ---
 if run_button:
     if not all_portfolios_data_original or all_navs_df is None:
-        st.error("There was an issue reading the file or fetching data. Please try re-uploading the file.")
+        st.error("Data could not be loaded. Please refresh the page.")
         st.stop()
     if start_date > end_date:
         st.error("Error: End date must be on or after start date.")
@@ -206,7 +222,6 @@ if run_button:
     
     start_ts, end_ts = pd.to_datetime(start_date), pd.to_datetime(end_date)
     
-    # --- IMPROVEMENT: Filter portfolios and warn user about skipped ones ---
     all_portfolios_data = {}
     skipped_portfolios = []
     for name, df in all_portfolios_data_original.items():
@@ -220,7 +235,7 @@ if run_button:
         st.warning(f"The following portfolios were skipped as they have fewer than two rebalancing dates in the selected range: **{', '.join(skipped_portfolios)}**")
 
     if not all_portfolios_data:
-        st.warning("No portfolios with sufficient data in the selected date range. Please select a wider range or check your file.")
+        st.warning("No portfolios with sufficient data in the selected date range. Please select a wider range or check the data source.")
         st.stop()
         
     navs_df_filtered = all_navs_df.loc[start_ts:end_ts]
@@ -229,6 +244,8 @@ if run_button:
     excel_cmap = LinearSegmentedColormap.from_list("excel_like", ["#f8696b", "#ffeb84", "#63be7b"])
 
     with st.spinner("Calculating portfolio performance..."):
+        # (The entire calculation logic from here remains unchanged)
+        # ... [The rest of the calculation code is identical to the previous version] ...
         all_daily_returns = navs_df_filtered.pct_change()
         latest_date = navs_df_filtered.index.max()
         earliest_date = navs_df_filtered.index.min()
@@ -243,7 +260,6 @@ if run_button:
             daily_value_index = (1 + daily_portfolio_returns).cumprod().fillna(1) * initial_investment
             daily_value_index.iloc[0] = initial_investment
 
-            # --- IMPROVEMENT: Calculate and store portfolio trailing returns once ---
             portfolio_trailing_returns = calculate_trailing_returns(daily_value_index)
 
             rebal_dates = allocations.columns
@@ -279,7 +295,7 @@ if run_button:
             portfolio_results[name] = {
                 'allocations': allocations,
                 'daily_value_index': daily_value_index,
-                'portfolio_trailing_returns': portfolio_trailing_returns, # Stored here
+                'portfolio_trailing_returns': portfolio_trailing_returns,
                 'periodic_fund_returns': periodic_fund_returns.T,
                 'periodic_portfolio_returns': periodic_portfolio_returns,
                 'benchmark_periodic_returns': benchmark_periodic_returns,
@@ -296,8 +312,10 @@ if run_button:
                 b_returns = all_daily_returns[b_code].reindex(unified_date_range).fillna(0)
                 b_index = (1 + b_returns).cumprod().fillna(1) * initial_investment
                 benchmark_daily_indices[b_name] = b_index
-
+    
     # --- UI Rendering ---
+    # (The entire UI rendering logic from here remains unchanged)
+    # ... [The rest of the UI rendering code is identical to the previous version] ...
     tab_names = ["📈 Comparison"] + list(portfolio_results.keys())
     tabs = st.tabs(tab_names)
 
@@ -305,7 +323,6 @@ if run_button:
         st.header("Overall Portfolio Comparison")
         st.subheader("Trailing Returns Comparison")
         
-        # --- CORRECT & EFFICIENT METHOD: Use pre-calculated results ---
         comparison_df = pd.DataFrame({
             name: res['portfolio_trailing_returns'] 
             for name, res in portfolio_results.items()
@@ -324,7 +341,6 @@ if run_button:
             fund_names_map = get_names_from_codes(results['allocations'].index.tolist())
 
             st.subheader("📈 Portfolio Growth vs Benchmarks")
-            # --- IMPROVEMENT: Normalize charts for fair visual comparison ---
             portfolio_start_date_tab = results['daily_value_index'].index.min()
             portfolio_start_value = results['daily_value_index'].iloc[0]
             
@@ -354,7 +370,6 @@ if run_button:
             st.dataframe(style_table(fund_trailing_returns_display[final_cols_trailing_funds].style, '{:.2%}', 'N/A', excel_cmap, 'Weight'), use_container_width=True)
             
             st.markdown("##### **Portfolio vs. Benchmarks**")
-            # --- EFFICIENT METHOD: Reuse pre-calculated result ---
             portfolio_trailing_returns = results['portfolio_trailing_returns']
             portfolio_trailing_returns.name = name
             
@@ -414,5 +429,6 @@ if run_button:
             combined_periodic.columns = [c.strftime('%b-%Y') for c in combined_periodic.columns]
             st.dataframe(style_table(combined_periodic.style, '{:.2f}%', 'None', excel_cmap), use_container_width=True)
 
-elif not uploaded_file:
-    st.info("👋 Welcome! Upload a portfolio file to begin.")
+elif not all_portfolios_data_original:
+    # This block will now only be reached if the initial load from Google Sheets fails.
+    st.info("👋 Welcome! Data is being loaded. If you see an error, please check the secrets configuration.")
