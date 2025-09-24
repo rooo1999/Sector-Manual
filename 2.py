@@ -15,6 +15,16 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- Global Constants ---
+BENCHMARKS = {
+    "Nifty 50 TRI": "147794",
+    "Nifty 500 TRI": "147625",
+    "Smallcap 250 TRI": "147623",
+    "Midcap 150 TRI": "147622",
+    "Sensex TRI": "119597"
+}
+TRAILING_COLS_ORDER = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year', '3 Years', '5 Years']
+
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 
@@ -100,12 +110,10 @@ def calculate_trailing_returns(series):
 
     end_date, end_value = series.index[-1], series.iloc[-1]
     
-    # --- MODIFICATION: YTD now starts from the last day of the previous year ---
     special_periods = {
         'MTD': datetime(end_date.year, end_date.month, 1),
         'YTD': pd.to_datetime(f'{end_date.year - 1}-12-31')
     }
-    # --- END MODIFICATION ---
 
     for period_name, start_date_target in special_periods.items():
         try:
@@ -169,10 +177,6 @@ with st.sidebar:
         with st.spinner("Reading file and fetching market data..."):
             all_portfolios_data_original = read_all_portfolios(uploaded_file)
             if all_portfolios_data_original:
-                BENCHMARKS = {
-                    "Nifty 50 TRI": "147794", "Nifty 500 TRI": "147625", "Smallcap 250 TRI": "147623",
-                    "Midcap 150 TRI": "147622", "Sensex TRI": "119597"
-                }
                 all_fund_codes = set(code for p in all_portfolios_data_original.values() for code in p.index)
                 all_scheme_codes = tuple(all_fund_codes | set(BENCHMARKS.values()))
                 
@@ -202,14 +206,21 @@ if run_button:
     
     start_ts, end_ts = pd.to_datetime(start_date), pd.to_datetime(end_date)
     
+    # --- IMPROVEMENT: Filter portfolios and warn user about skipped ones ---
     all_portfolios_data = {}
+    skipped_portfolios = []
     for name, df in all_portfolios_data_original.items():
         filtered_allocations = df.loc[:, (df.columns >= start_ts) & (df.columns <= end_ts)]
         if filtered_allocations.shape[1] >= 2:
             all_portfolios_data[name] = filtered_allocations
+        elif not filtered_allocations.empty:
+            skipped_portfolios.append(name)
     
+    if skipped_portfolios:
+        st.warning(f"The following portfolios were skipped as they have fewer than two rebalancing dates in the selected range: **{', '.join(skipped_portfolios)}**")
+
     if not all_portfolios_data:
-        st.warning("No portfolios with sufficient data in the selected date range. Please select a wider range.")
+        st.warning("No portfolios with sufficient data in the selected date range. Please select a wider range or check your file.")
         st.stop()
         
     navs_df_filtered = all_navs_df.loc[start_ts:end_ts]
@@ -231,6 +242,9 @@ if run_button:
             daily_portfolio_returns = (daily_allocations * portfolio_fund_returns).sum(axis=1, min_count=1)
             daily_value_index = (1 + daily_portfolio_returns).cumprod().fillna(1) * initial_investment
             daily_value_index.iloc[0] = initial_investment
+
+            # --- IMPROVEMENT: Calculate and store portfolio trailing returns once ---
+            portfolio_trailing_returns = calculate_trailing_returns(daily_value_index)
 
             rebal_dates = allocations.columns
             periodic_navs = navs_df_filtered.reindex(rebal_dates, method='ffill')
@@ -263,7 +277,9 @@ if run_button:
             yoy_benchmark_returns.columns = BENCHMARKS.keys()
             
             portfolio_results[name] = {
-                'allocations': allocations, 'daily_value_index': daily_value_index,
+                'allocations': allocations,
+                'daily_value_index': daily_value_index,
+                'portfolio_trailing_returns': portfolio_trailing_returns, # Stored here
                 'periodic_fund_returns': periodic_fund_returns.T,
                 'periodic_portfolio_returns': periodic_portfolio_returns,
                 'benchmark_periodic_returns': benchmark_periodic_returns,
@@ -288,27 +304,15 @@ if run_button:
     with tabs[0]:
         st.header("Overall Portfolio Comparison")
         st.subheader("Trailing Returns Comparison")
-
-        # --- START: MODIFIED/CORRECTED CODE ---
-        # The original method was mathematically incorrect. A portfolio's compounded return is NOT
-        # the weighted average of its components' compounded returns.
-        # The correct method is to calculate returns from the portfolio's daily value index,
-        # which is exactly what is done in the individual portfolio tabs. We replicate that here.
         
-        comparison_trailing_returns = {}
-        for name, res in portfolio_results.items():
-            # Calculate trailing returns directly from the portfolio's daily value series
-            portfolio_trailing = calculate_trailing_returns(res['daily_value_index'])
-            comparison_trailing_returns[name] = portfolio_trailing
+        # --- CORRECT & EFFICIENT METHOD: Use pre-calculated results ---
+        comparison_df = pd.DataFrame({
+            name: res['portfolio_trailing_returns'] 
+            for name, res in portfolio_results.items()
+        }).T
         
-        comparison_df = pd.DataFrame(comparison_trailing_returns).T
-        
-        # Ensure consistent column order with other tables
-        cols_order = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year', '3 Years', '5 Years']
-        final_cols_comparison = [c for c in cols_order if c in comparison_df.columns]
-        
+        final_cols_comparison = [c for c in TRAILING_COLS_ORDER if c in comparison_df.columns]
         st.dataframe(style_table(comparison_df[final_cols_comparison].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
-        # --- END: MODIFIED/CORRECTED CODE ---
 
         st.subheader("Portfolio Value Growth Comparison")
         growth_df = pd.concat({name: res['daily_value_index'] for name, res in portfolio_results.items()}, axis=1)
@@ -320,9 +324,21 @@ if run_button:
             fund_names_map = get_names_from_codes(results['allocations'].index.tolist())
 
             st.subheader("📈 Portfolio Growth vs Benchmarks")
+            # --- IMPROVEMENT: Normalize charts for fair visual comparison ---
             portfolio_start_date_tab = results['daily_value_index'].index.min()
-            filtered_benchmark_indices = {b_name: b_index.loc[portfolio_start_date_tab:] for b_name, b_index in benchmark_daily_indices.items()}
-            benchmark_growth_df = pd.DataFrame(filtered_benchmark_indices)
+            portfolio_start_value = results['daily_value_index'].iloc[0]
+            
+            filtered_benchmark_indices = {
+                b_name: b_index.loc[portfolio_start_date_tab:] 
+                for b_name, b_index in benchmark_daily_indices.items()
+            }
+            
+            normalized_benchmark_indices = {}
+            for b_name, b_series in filtered_benchmark_indices.items():
+                if not b_series.empty:
+                    normalized_benchmark_indices[b_name] = (b_series / b_series.iloc[0]) * portfolio_start_value
+            
+            benchmark_growth_df = pd.DataFrame(normalized_benchmark_indices)
             combined_growth = pd.concat([results['daily_value_index'], benchmark_growth_df], axis=1)
             combined_growth.columns.values[0] = name
             st.line_chart(combined_growth)
@@ -334,19 +350,18 @@ if run_button:
             fund_trailing_returns_display['Weight'] = results['allocations'].iloc[:, -1]
             fund_trailing_returns_display.index = fund_trailing_returns_display.index.map(fund_names_map)
             
-            cols_order = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year', '3 Years', '5 Years']
-            final_cols_trailing_funds = ['Weight'] + [c for c in cols_order if c in fund_trailing_returns_display.columns]
+            final_cols_trailing_funds = ['Weight'] + [c for c in TRAILING_COLS_ORDER if c in fund_trailing_returns_display.columns]
             st.dataframe(style_table(fund_trailing_returns_display[final_cols_trailing_funds].style, '{:.2%}', 'N/A', excel_cmap, 'Weight'), use_container_width=True)
             
-            # --- THIS IS THE CORRECTED, ACCURATE METHOD ---
             st.markdown("##### **Portfolio vs. Benchmarks**")
-            portfolio_trailing_returns = calculate_trailing_returns(results['daily_value_index'])
+            # --- EFFICIENT METHOD: Reuse pre-calculated result ---
+            portfolio_trailing_returns = results['portfolio_trailing_returns']
             portfolio_trailing_returns.name = name
             
             benchmarks_trailing = pd.DataFrame(filtered_benchmark_indices).apply(calculate_trailing_returns).T
             combined_trailing = pd.concat([portfolio_trailing_returns.to_frame().T, benchmarks_trailing])
             
-            final_cols_trailing = [c for c in cols_order if c in combined_trailing.columns]
+            final_cols_trailing = [c for c in TRAILING_COLS_ORDER if c in combined_trailing.columns]
             st.dataframe(style_table(combined_trailing[final_cols_trailing].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
 
             st.markdown("---")
