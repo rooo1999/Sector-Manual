@@ -320,10 +320,9 @@ if run_button:
             final_cols_trailing_funds = ['Weight'] + [c for c in cols_order if c in fund_trailing_returns_display.columns]
             st.dataframe(style_table(fund_trailing_returns_display[final_cols_trailing_funds].style, '{:.2%}', 'N/A', excel_cmap, 'Weight'), use_container_width=True)
             
+            # --- THIS IS THE CORRECTED, ACCURATE METHOD ---
             st.markdown("##### **Portfolio vs. Benchmarks**")
-            weights = results['allocations'].iloc[:, -1]
-            valid_weights = weights[weights > 0]
-            portfolio_trailing_returns = (results['fund_trailing_returns'].loc[valid_weights.index].T * valid_weights).sum(axis=1)
+            portfolio_trailing_returns = calculate_trailing_returns(results['daily_value_index'])
             portfolio_trailing_returns.name = name
             
             benchmarks_trailing = pd.DataFrame(filtered_benchmark_indices).apply(calculate_trailing_returns).T
