@@ -15,28 +15,15 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Global Constants ---
-BENCHMARKS = {
-    "Nifty 50 TRI": "147794",
-    "Nifty 500 TRI": "147625",
-    "Smallcap 250 TRI": "147623",
-    "Midcap 150 TRI": "147622",
-    "Sensex TRI": "119597"
-}
-TRAILING_COLS_ORDER = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year', '3 Years', '5 Years']
-
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 
 # --- Helper Functions ---
-
-# MODIFIED: New function to read from a public Google Sheet
-@st.cache_data(ttl="1h", show_spinner="Loading portfolio allocation data...")
-def read_portfolios_from_google_sheet(sheet_id):
-    """Reads all sheets from a public Google Sheet and cleans them up."""
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+@st.cache_data
+def read_all_portfolios(uploaded_file):
+    """Reads all sheets from an Excel file and cleans them up to be portfolio allocation DataFrames."""
     try:
-        all_sheets = pd.read_excel(url, sheet_name=None, engine='openpyxl', dtype={0: str})
+        all_sheets = pd.read_excel(uploaded_file, sheet_name=None, engine='openpyxl', dtype={0: str})
         cleaned_portfolios = {}
         for sheet_name, df in all_sheets.items():
             df = df.dropna(how='all').dropna(how='all', axis=1)
@@ -53,7 +40,7 @@ def read_portfolios_from_google_sheet(sheet_id):
                 cleaned_portfolios[sheet_name] = df
         return cleaned_portfolios
     except Exception as e:
-        st.error(f"Error reading from Google Sheet. Please ensure the Sheet ID is correct and the sheet is public ('Anyone with the link'). Error: {e}")
+        st.error(f"Error reading Excel file: {e}")
         return {}
 
 @st.cache_data(ttl="6h")
@@ -113,10 +100,12 @@ def calculate_trailing_returns(series):
 
     end_date, end_value = series.index[-1], series.iloc[-1]
     
+    # --- MODIFICATION: YTD now starts from the last day of the previous year ---
     special_periods = {
         'MTD': datetime(end_date.year, end_date.month, 1),
         'YTD': pd.to_datetime(f'{end_date.year - 1}-12-31')
     }
+    # --- END MODIFICATION ---
 
     for period_name, start_date_target in special_periods.items():
         try:
@@ -164,47 +153,40 @@ def style_table(styler, format_str, na_rep, cmap, weight_col=None):
 
 # --- Main App ---
 st.title("🚀 Comprehensive Portfolio Performance Dashboard")
-st.markdown("Analyse portfolio performance using periodic returns from a live data source and **up-to-date trailing returns** from market data.")
-
-# --- Data Loading ---
-all_portfolios_data_original = None
-all_navs_df = None
-
-try:
-    google_sheet_id = st.secrets["GOOGLE_SHEET_ID"]
-    all_portfolios_data_original = read_portfolios_from_google_sheet(google_sheet_id)
-except KeyError:
-    st.error("`GOOGLE_SHEET_ID` not found in Streamlit secrets. Please add it to your `.streamlit/secrets.toml` file.")
-    st.stop()
-except Exception as e:
-    st.error(f"An unexpected error occurred during data loading: {e}")
-    st.stop()
-
-if all_portfolios_data_original:
-    with st.spinner("Fetching market data..."):
-        all_fund_codes = set(code for p in all_portfolios_data_original.values() for code in p.index)
-        all_scheme_codes = tuple(all_fund_codes | set(BENCHMARKS.values()))
-        
-        full_nav_history = _fetch_full_nav_history(all_scheme_codes)
-        all_navs_df = pd.DataFrame(full_nav_history).ffill().bfill()
-else:
-    st.warning("No portfolio data was loaded from the Google Sheet. Please check the sheet's format and sharing settings.")
-    st.stop()
+st.markdown("Analyse portfolio performance using periodic returns from your file and **up-to-date trailing returns** from live market data.")
 
 # --- Sidebar Controls ---
 with st.sidebar:
     st.header("⚙️ Controls")
-    initial_investment = st.number_input("1. Initial Investment", min_value=1.0, value=10000.0, step=1000.0)
+    uploaded_file = st.file_uploader("1. Upload Portfolio Excel File", type=['xlsx'])
+    initial_investment = st.number_input("2. Initial Investment", min_value=1.0, value=10000.0, step=1000.0)
 
     start_date, end_date = None, None
-    if not all_navs_df.empty:
-        api_min_date = all_navs_df.index.min().date()
-        api_max_date = all_navs_df.index.max().date()
-        
-        st.markdown("---")
-        st.header("2. Set Date Range")
-        start_date = st.date_input("Analysis Start Date", value=api_min_date, min_value=api_min_date, max_value=api_max_date)
-        end_date = st.date_input("Analysis End Date", value=api_max_date, min_value=api_min_date, max_value=api_max_date)
+    all_portfolios_data_original = None
+    all_navs_df = None
+
+    if uploaded_file:
+        with st.spinner("Reading file and fetching market data..."):
+            all_portfolios_data_original = read_all_portfolios(uploaded_file)
+            if all_portfolios_data_original:
+                BENCHMARKS = {
+                    "Nifty 50 TRI": "147794", "Nifty 500 TRI": "147625", "Smallcap 250 TRI": "147623",
+                    "Midcap 150 TRI": "147622", "Sensex TRI": "119597"
+                }
+                all_fund_codes = set(code for p in all_portfolios_data_original.values() for code in p.index)
+                all_scheme_codes = tuple(all_fund_codes | set(BENCHMARKS.values()))
+                
+                full_nav_history = _fetch_full_nav_history(all_scheme_codes)
+                all_navs_df = pd.DataFrame(full_nav_history).ffill().bfill()
+
+                if not all_navs_df.empty:
+                    api_min_date = all_navs_df.index.min().date()
+                    api_max_date = all_navs_df.index.max().date()
+                    
+                    st.markdown("---")
+                    st.header("3. Set Date Range")
+                    start_date = st.date_input("Analysis Start Date", value=api_min_date, min_value=api_min_date, max_value=api_max_date)
+                    end_date = st.date_input("Analysis End Date", value=api_max_date, min_value=api_min_date, max_value=api_max_date)
 
     st.markdown("---")
     run_button = st.button("📊 Run Analysis", type="primary", use_container_width=True, disabled=(not start_date))
@@ -212,7 +194,7 @@ with st.sidebar:
 # --- Main Execution Block ---
 if run_button:
     if not all_portfolios_data_original or all_navs_df is None:
-        st.error("Data could not be loaded. Please refresh the page.")
+        st.error("There was an issue reading the file or fetching data. Please try re-uploading the file.")
         st.stop()
     if start_date > end_date:
         st.error("Error: End date must be on or after start date.")
@@ -221,19 +203,13 @@ if run_button:
     start_ts, end_ts = pd.to_datetime(start_date), pd.to_datetime(end_date)
     
     all_portfolios_data = {}
-    skipped_portfolios = []
     for name, df in all_portfolios_data_original.items():
         filtered_allocations = df.loc[:, (df.columns >= start_ts) & (df.columns <= end_ts)]
         if filtered_allocations.shape[1] >= 2:
             all_portfolios_data[name] = filtered_allocations
-        elif not filtered_allocations.empty:
-            skipped_portfolios.append(name)
     
-    if skipped_portfolios:
-        st.warning(f"The following portfolios were skipped as they have fewer than two rebalancing dates in the selected range: **{', '.join(skipped_portfolios)}**")
-
     if not all_portfolios_data:
-        st.warning("No portfolios with sufficient data in the selected date range. Please select a wider range or check the data source.")
+        st.warning("No portfolios with sufficient data in the selected date range. Please select a wider range.")
         st.stop()
         
     navs_df_filtered = all_navs_df.loc[start_ts:end_ts]
@@ -248,58 +224,13 @@ if run_button:
         
         for name, allocations in all_portfolios_data.items():
             portfolio_start_date = allocations.columns.min()
-
-            # =================================================================================
-            # === NEW, CORRECTED PORTFOLIO CALCULATION LOGIC ==================================
-            # This logic correctly simulates a periodically rebalanced portfolio by modeling
-            # the day-to-day drift of assets and only rebalancing on specified dates.
-            # =================================================================================
-
-            # 1. Prepare data for the simulation period
+            
             date_range = pd.date_range(start=portfolio_start_date, end=latest_date, freq='D')
-            portfolio_fund_returns = all_daily_returns[allocations.index].reindex(date_range).fillna(0)
-            daily_target_allocations = allocations.T.reindex(date_range, method='ffill')
-
-            # 2. Initialize simulation variables
-            # Series to store the final total portfolio value each day
-            daily_value_index = pd.Series(index=date_range, dtype=float)
+            daily_allocations = allocations.T.reindex(date_range, method='ffill')
+            portfolio_fund_returns = all_daily_returns[allocations.index].reindex(daily_allocations.index).fillna(0)
+            daily_portfolio_returns = (daily_allocations * portfolio_fund_returns).sum(axis=1, min_count=1)
+            daily_value_index = (1 + daily_portfolio_returns).cumprod().fillna(1) * initial_investment
             daily_value_index.iloc[0] = initial_investment
-            
-            # DataFrame to store the daily VALUE of each individual fund holding ("buckets")
-            holdings_value = pd.DataFrame(index=date_range, columns=allocations.index, dtype=float)
-            holdings_value.iloc[0] = initial_investment * daily_target_allocations.iloc[0]
-
-            # 3. Loop through each day to simulate growth and rebalancing
-            for t in range(1, len(date_range)):
-                prev_date = date_range[t-1]
-                current_date = date_range[t]
-
-                # A. Model Drift: Grow yesterday's holdings with today's returns.
-                # This is the "real" movement of money.
-                grown_holdings = holdings_value.loc[prev_date] * (1 + portfolio_fund_returns.loc[current_date])
-                
-                # B. Check if today is a rebalancing day by comparing target allocations.
-                # A rebalance is triggered if the target weights for today are different from yesterday.
-                if not daily_target_allocations.loc[current_date].equals(daily_target_allocations.loc[prev_date]):
-                    # It's a rebalancing day.
-                    # First, find the total value of the portfolio after today's growth.
-                    total_portfolio_value = grown_holdings.sum()
-                    # Then, redistribute this total value according to the NEW target allocations.
-                    holdings_value.loc[current_date] = total_portfolio_value * daily_target_allocations.loc[current_date]
-                else:
-                    # It's a normal day. The holdings are simply the grown values. No rebalancing.
-                    holdings_value.loc[current_date] = grown_holdings
-                
-                # C. The total portfolio value for the day is the sum of all individual holdings.
-                daily_value_index.loc[current_date] = holdings_value.loc[current_date].sum()
-                
-            daily_value_index = daily_value_index.dropna()
-            
-            # === END OF NEW LOGIC ============================================================
-            # The rest of the code now uses the correctly calculated `daily_value_index`
-            # =================================================================================
-
-            portfolio_trailing_returns = calculate_trailing_returns(daily_value_index)
 
             rebal_dates = allocations.columns
             periodic_navs = navs_df_filtered.reindex(rebal_dates, method='ffill')
@@ -323,7 +254,7 @@ if run_button:
             yoy_navs = navs_df_filtered.reindex(year_end_targets, method='pad').dropna(how='all')
             yoy_fund_returns = yoy_navs[allocations.index].pct_change()
             
-            yoy_allocations = daily_target_allocations.reindex(yoy_navs.index, method='pad')
+            yoy_allocations = daily_allocations.reindex(yoy_navs.index, method='pad')
             begin_year_allocs = yoy_allocations.shift(1)
             
             yoy_portfolio_returns = (yoy_fund_returns * begin_year_allocs).sum(axis=1, min_count=1)
@@ -332,9 +263,7 @@ if run_button:
             yoy_benchmark_returns.columns = BENCHMARKS.keys()
             
             portfolio_results[name] = {
-                'allocations': allocations,
-                'daily_value_index': daily_value_index,
-                'portfolio_trailing_returns': portfolio_trailing_returns,
+                'allocations': allocations, 'daily_value_index': daily_value_index,
                 'periodic_fund_returns': periodic_fund_returns.T,
                 'periodic_portfolio_returns': periodic_portfolio_returns,
                 'benchmark_periodic_returns': benchmark_periodic_returns,
@@ -351,7 +280,7 @@ if run_button:
                 b_returns = all_daily_returns[b_code].reindex(unified_date_range).fillna(0)
                 b_index = (1 + b_returns).cumprod().fillna(1) * initial_investment
                 benchmark_daily_indices[b_name] = b_index
-    
+
     # --- UI Rendering ---
     tab_names = ["📈 Comparison"] + list(portfolio_results.keys())
     tabs = st.tabs(tab_names)
@@ -359,14 +288,27 @@ if run_button:
     with tabs[0]:
         st.header("Overall Portfolio Comparison")
         st.subheader("Trailing Returns Comparison")
+
+        # --- START: MODIFIED/CORRECTED CODE ---
+        # The original method was mathematically incorrect. A portfolio's compounded return is NOT
+        # the weighted average of its components' compounded returns.
+        # The correct method is to calculate returns from the portfolio's daily value index,
+        # which is exactly what is done in the individual portfolio tabs. We replicate that here.
         
-        comparison_df = pd.DataFrame({
-            name: res['portfolio_trailing_returns'] 
-            for name, res in portfolio_results.items()
-        }).T
+        comparison_trailing_returns = {}
+        for name, res in portfolio_results.items():
+            # Calculate trailing returns directly from the portfolio's daily value series
+            portfolio_trailing = calculate_trailing_returns(res['daily_value_index'])
+            comparison_trailing_returns[name] = portfolio_trailing
         
-        final_cols_comparison = [c for c in TRAILING_COLS_ORDER if c in comparison_df.columns]
+        comparison_df = pd.DataFrame(comparison_trailing_returns).T
+        
+        # Ensure consistent column order with other tables
+        cols_order = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year', '3 Years', '5 Years']
+        final_cols_comparison = [c for c in cols_order if c in comparison_df.columns]
+        
         st.dataframe(style_table(comparison_df[final_cols_comparison].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
+        # --- END: MODIFIED/CORRECTED CODE ---
 
         st.subheader("Portfolio Value Growth Comparison")
         growth_df = pd.concat({name: res['daily_value_index'] for name, res in portfolio_results.items()}, axis=1)
@@ -379,19 +321,8 @@ if run_button:
 
             st.subheader("📈 Portfolio Growth vs Benchmarks")
             portfolio_start_date_tab = results['daily_value_index'].index.min()
-            portfolio_start_value = results['daily_value_index'].iloc[0]
-            
-            filtered_benchmark_indices = {
-                b_name: b_index.loc[portfolio_start_date_tab:] 
-                for b_name, b_index in benchmark_daily_indices.items()
-            }
-            
-            normalized_benchmark_indices = {}
-            for b_name, b_series in filtered_benchmark_indices.items():
-                if not b_series.empty:
-                    normalized_benchmark_indices[b_name] = (b_series / b_series.iloc[0]) * portfolio_start_value
-            
-            benchmark_growth_df = pd.DataFrame(normalized_benchmark_indices)
+            filtered_benchmark_indices = {b_name: b_index.loc[portfolio_start_date_tab:] for b_name, b_index in benchmark_daily_indices.items()}
+            benchmark_growth_df = pd.DataFrame(filtered_benchmark_indices)
             combined_growth = pd.concat([results['daily_value_index'], benchmark_growth_df], axis=1)
             combined_growth.columns.values[0] = name
             st.line_chart(combined_growth)
@@ -403,17 +334,19 @@ if run_button:
             fund_trailing_returns_display['Weight'] = results['allocations'].iloc[:, -1]
             fund_trailing_returns_display.index = fund_trailing_returns_display.index.map(fund_names_map)
             
-            final_cols_trailing_funds = ['Weight'] + [c for c in TRAILING_COLS_ORDER if c in fund_trailing_returns_display.columns]
+            cols_order = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year', '3 Years', '5 Years']
+            final_cols_trailing_funds = ['Weight'] + [c for c in cols_order if c in fund_trailing_returns_display.columns]
             st.dataframe(style_table(fund_trailing_returns_display[final_cols_trailing_funds].style, '{:.2%}', 'N/A', excel_cmap, 'Weight'), use_container_width=True)
             
+            # --- THIS IS THE CORRECTED, ACCURATE METHOD ---
             st.markdown("##### **Portfolio vs. Benchmarks**")
-            portfolio_trailing_returns = results['portfolio_trailing_returns']
+            portfolio_trailing_returns = calculate_trailing_returns(results['daily_value_index'])
             portfolio_trailing_returns.name = name
             
             benchmarks_trailing = pd.DataFrame(filtered_benchmark_indices).apply(calculate_trailing_returns).T
             combined_trailing = pd.concat([portfolio_trailing_returns.to_frame().T, benchmarks_trailing])
             
-            final_cols_trailing = [c for c in TRAILING_COLS_ORDER if c in combined_trailing.columns]
+            final_cols_trailing = [c for c in cols_order if c in combined_trailing.columns]
             st.dataframe(style_table(combined_trailing[final_cols_trailing].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
 
             st.markdown("---")
@@ -466,5 +399,5 @@ if run_button:
             combined_periodic.columns = [c.strftime('%b-%Y') for c in combined_periodic.columns]
             st.dataframe(style_table(combined_periodic.style, '{:.2f}%', 'None', excel_cmap), use_container_width=True)
 
-elif not all_portfolios_data_original:
-    st.info("👋 Welcome! Data is being loaded. If you see an error, please check the secrets configuration.")
+elif not uploaded_file:
+    st.info("👋 Welcome! Upload a portfolio file to begin.")
