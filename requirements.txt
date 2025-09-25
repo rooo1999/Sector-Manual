@@ -1,0 +1,12 @@
+streamlit
+pandas
+requests
+python-dateutil
+matplotlib
+seaborn
+plotly
+openpyxl
+setuptools
+numpy
+pandas_ta
+mftool
