@@ -21,7 +21,7 @@ BENCHMARKS = {
     "Nifty 500 TRI": "147625",
     "Smallcap 250 TRI": "147623",
     "Midcap 150 TRI": "147622",
-    "Sensex TRI": "119597"
+    "Sensex TRI": "119065"
 }
 TRAILING_COLS_ORDER = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year', '3 Years', '5 Years']
 
