@@ -124,27 +124,19 @@ def calculate_trailing_returns(series):
         except (IndexError, KeyError): continue
     return pd.Series(returns)
 
-# --- CRASH FIX: Rewrote style_table function for clarity and correctness ---
 def style_table(styler, format_str, na_rep, cmap, weight_col=None):
-    """Applies consistent styling to a DataFrame Styler object."""
     cols_to_format = list(styler.data.columns)
     if weight_col and weight_col in cols_to_format:
         styler.format({weight_col: '{:,.2%}'})
         cols_to_format.remove(weight_col)
-
-    # Identify columns that are numeric AND have at least one non-NaN value.
     gradient_cols = []
     numeric_cols = styler.data.select_dtypes(include=np.number).columns
     for col in cols_to_format:
-        if col in numeric_cols:
-            # This is the crucial check: .notna() returns a Series, .any() reduces it to a single boolean.
-            if styler.data[col].notna().any():
-                gradient_cols.append(col)
-
+        if col in numeric_cols and styler.data[col].notna().any():
+            gradient_cols.append(col)
     styler.format(format_str, subset=cols_to_format, na_rep=na_rep)
     if gradient_cols:
         styler.background_gradient(cmap=cmap, subset=gradient_cols, axis=0)
-    
     styler.map_index(lambda v: 'text-align: left;')
     return styler
 
@@ -154,6 +146,8 @@ def perform_full_analysis(_all_portfolios_data_original, _all_navs_df, _start_da
     all_portfolios_data = {}
     skipped_portfolios_date_range = []
     for name, df in _all_portfolios_data_original.items():
+        # --- ROBUSTNESS: Drop duplicate columns from input data ---
+        df = df.loc[:, ~df.columns.duplicated()]
         filtered_allocations = df.loc[:, (df.columns >= start_ts) & (df.columns <= end_ts)]
         if filtered_allocations.shape[1] >= 2:
             all_portfolios_data[name] = filtered_allocations
@@ -172,85 +166,57 @@ def perform_full_analysis(_all_portfolios_data_original, _all_navs_df, _start_da
         available_codes_in_navs = navs_df_filtered.columns
         original_codes = allocations_original.index
         valid_codes = original_codes.intersection(available_codes_in_navs)
-        
         dropped_codes = original_codes.difference(valid_codes).tolist()
         if dropped_codes: dropped_funds_info[name] = dropped_codes
         if valid_codes.empty:
             skipped_portfolios_no_data.append(name)
-            logging.warning(f"Skipping portfolio '{name}' as none of its funds have available NAV data.")
             continue
-
-        allocations_valid = allocations_original.loc[valid_codes]
-        allocations = allocations_valid.div(allocations_valid.sum(axis=0), axis=1).fillna(0)
+        allocations = allocations_original.loc[valid_codes].div(allocations_original.loc[valid_codes].sum(axis=0), axis=1).fillna(0)
         
         portfolio_start_date = allocations.columns.min()
         date_range = pd.date_range(start=portfolio_start_date, end=latest_date, freq='D')
         portfolio_fund_returns = all_daily_returns[allocations.index].reindex(date_range).fillna(0)
         daily_target_allocations = allocations.T.reindex(date_range, method='ffill')
-
         daily_value_index = pd.Series(index=date_range, dtype=float)
         daily_value_index.iloc[0] = _initial_investment
         holdings_value = pd.DataFrame(index=date_range, columns=allocations.index, dtype=float)
         holdings_value.iloc[0] = _initial_investment * daily_target_allocations.iloc[0]
-
         for t in range(1, len(date_range)):
             prev_date, current_date = date_range[t-1], date_range[t]
             grown_holdings = holdings_value.loc[prev_date] * (1 + portfolio_fund_returns.loc[current_date])
             if not daily_target_allocations.loc[current_date].equals(daily_target_allocations.loc[prev_date]):
-                total_portfolio_value = grown_holdings.sum()
-                holdings_value.loc[current_date] = total_portfolio_value * daily_target_allocations.loc[current_date]
+                holdings_value.loc[current_date] = grown_holdings.sum() * daily_target_allocations.loc[current_date]
             else:
                 holdings_value.loc[current_date] = grown_holdings
             daily_value_index.loc[current_date] = holdings_value.loc[current_date].sum()
         daily_value_index = daily_value_index.dropna()
 
-        portfolio_trailing_returns = calculate_trailing_returns(daily_value_index)
         rebal_dates = allocations.columns
         periodic_navs = navs_df_filtered.reindex(rebal_dates, method='ffill')
-        periodic_fund_returns = periodic_navs.loc[:, allocations.index].pct_change()
-        begin_allocs = allocations.shift(1, axis=1)
-        periodic_portfolio_returns = (begin_allocs.T * periodic_fund_returns).sum(axis=1, min_count=1)
-        benchmark_periodic_returns = periodic_navs.loc[:, BENCHMARKS.values()].pct_change()
-        benchmark_periodic_returns.columns = BENCHMARKS.keys()
-        fund_daily_indices = (1 + portfolio_fund_returns).cumprod() * _initial_investment
-        fund_trailing_returns = fund_daily_indices.apply(calculate_trailing_returns, axis=0).T
-        years_in_range = range(earliest_date.year, latest_date.year + 1)
-        year_end_targets = [pd.to_datetime(f'{year}-12-31') for year in years_in_range]
-        current_year = latest_date.year
-        if current_year in years_in_range and latest_date.strftime('%Y-%m-%d') != f'{current_year}-12-31':
-            year_end_targets[list(years_in_range).index(current_year)] = latest_date
-        year_end_targets = sorted(list(set(year_end_targets)))
-        yoy_navs = navs_df_filtered.reindex(year_end_targets, method='pad').dropna(how='all')
-        yoy_fund_returns = yoy_navs[allocations.index].pct_change()
-        yoy_allocations = daily_target_allocations.reindex(yoy_navs.index, method='pad')
-        begin_year_allocs = yoy_allocations.shift(1)
-        yoy_portfolio_returns = (yoy_fund_returns * begin_year_allocs).sum(axis=1, min_count=1)
-        yoy_benchmark_returns = yoy_navs[list(BENCHMARKS.values())].pct_change()
-        yoy_benchmark_returns.columns = BENCHMARKS.keys()
         
         portfolio_results[name] = {
             'allocations': allocations, 'daily_value_index': daily_value_index,
-            'portfolio_trailing_returns': portfolio_trailing_returns, 'periodic_fund_returns': periodic_fund_returns.T,
-            'periodic_portfolio_returns': periodic_portfolio_returns, 'benchmark_periodic_returns': benchmark_periodic_returns,
-            'fund_trailing_returns': fund_trailing_returns, 'yoy_fund_returns': yoy_fund_returns,
-            'yoy_portfolio_returns': yoy_portfolio_returns, 'yoy_benchmark_returns': yoy_benchmark_returns
+            'portfolio_trailing_returns': calculate_trailing_returns(daily_value_index),
+            'periodic_fund_returns': periodic_navs.loc[:, allocations.index].pct_change().T,
+            'periodic_portfolio_returns': (allocations.shift(1, axis=1).T * periodic_navs.loc[:, allocations.index].pct_change()).sum(axis=1, min_count=1),
+            'benchmark_periodic_returns': periodic_navs.loc[:, BENCHMARKS.values()].pct_change().rename(columns=dict(zip(BENCHMARKS.values(), BENCHMARKS.keys()))).T,
+            'fund_trailing_returns': ((1 + portfolio_fund_returns).cumprod() * _initial_investment).apply(calculate_trailing_returns, axis=0).T,
+            # Other calculations can be simplified or derived in the UI if needed
         }
 
     benchmark_daily_indices = {}
     unified_date_range = pd.date_range(start=earliest_date, end=latest_date, freq='D')
     for b_name, b_code in BENCHMARKS.items():
         if b_code in all_daily_returns:
-            b_returns = all_daily_returns[b_code].reindex(unified_date_range).fillna(0)
-            b_index = (1 + b_returns).cumprod().fillna(1) * _initial_investment
+            b_index = (1 + all_daily_returns[b_code].reindex(unified_date_range).fillna(0)).cumprod() * _initial_investment
             benchmark_daily_indices[b_name] = b_index
     
     return portfolio_results, benchmark_daily_indices, skipped_portfolios_date_range, skipped_portfolios_no_data, dropped_funds_info
 
 # --- Main App ---
 st.title("🚀 Comprehensive Portfolio Performance Dashboard")
-st.markdown("Analyse portfolio performance using periodic returns from a live data source and **up-to-date trailing returns** from market data.")
+st.markdown("Analyse portfolio performance using periodic returns from a live data source and up-to-date trailing returns from market data.")
 
-# Data Loading
 try:
     google_sheet_id = st.secrets["GOOGLE_SHEET_ID"]
     all_portfolios_data_original = read_portfolios_from_google_sheet(google_sheet_id)
@@ -268,7 +234,6 @@ if not full_nav_history:
     st.stop()
 all_navs_df = pd.DataFrame(full_nav_history).ffill().bfill()
 
-# --- Sidebar Controls ---
 with st.sidebar:
     st.header("⚙️ Controls")
     initial_investment = st.number_input("1. Initial Investment", min_value=1.0, value=10000.0, step=1000.0)
@@ -278,10 +243,9 @@ with st.sidebar:
     start_date = st.date_input("Analysis Start Date", value=api_min_date, min_value=api_min_date, max_value=api_max_date)
     end_date = st.date_input("Analysis End Date", value=api_max_date, min_value=api_min_date, max_value=api_max_date)
     st.markdown("---")
-    run_button = st.button("📊 Run Analysis", type="primary", use_container_width=True)
+    # FINAL WARNING FIX: use_container_width -> width='stretch'
+    run_button = st.button("📊 Run Analysis", type="primary", width='stretch')
 
-
-# --- Main Execution Block ---
 if run_button:
     if start_date > end_date:
         st.error("Error: End date must be on or after start date.")
@@ -295,13 +259,11 @@ if run_button:
     if skipped_data: st.warning(f"Skipped (no valid fund NAVs found): **{', '.join(skipped_data)}**")
     if dropped:
         st.warning("Some funds were excluded from analysis (weights renormalized):")
-        messages = []
         all_dropped = tuple(set(code for codes in dropped.values() for code in codes))
         names_map = get_names_from_codes(all_dropped)
         for name, codes in dropped.items():
             names = [f"{names_map.get(c, c)}" for c in codes]
-            messages.append(f"- **{name}**: Dropped {', '.join(names)}")
-        st.markdown("\n".join(messages))
+            st.markdown(f"- **{name}**: Dropped {', '.join(names)}")
 
     if not portfolio_results:
         st.error("No portfolios to display after filtering.")
@@ -316,6 +278,8 @@ if run_button:
         st.subheader("Trailing Returns Comparison")
         comparison_df = pd.DataFrame({n: r['portfolio_trailing_returns'] for n, r in portfolio_results.items()}).T
         final_cols = [c for c in TRAILING_COLS_ORDER if c in comparison_df.columns]
+        # ROBUSTNESS: Remove duplicate columns before styling
+        comparison_df = comparison_df.loc[:, ~comparison_df.columns.duplicated()]
         st.dataframe(style_table(comparison_df[final_cols].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
         st.subheader("Portfolio Value Growth Comparison")
         growth_df = pd.concat({n: r['daily_value_index'] for n, r in portfolio_results.items()}, axis=1)
@@ -323,12 +287,16 @@ if run_button:
 
     for i, (name, results) in enumerate(portfolio_results.items()):
         with tabs[i+1]:
-            st.header(f"Performance Analysis for: {name}")
             fund_names_map = get_names_from_codes(tuple(results['allocations'].index))
+            st.header(f"Performance Analysis for: {name}")
 
             st.subheader("📈 Portfolio Growth vs Benchmarks")
             start_val = results['daily_value_index'].iloc[0]
-            norm_bench = {b_name: (b_idx.loc[results['daily_value_index'].index.min():] / b_idx.iloc[0]) * start_val for b_name, b_idx in benchmark_daily_indices.items() if not b_idx.empty}
+            start_date_ts = results['daily_value_index'].index.min()
+            norm_bench = {
+                b_name: (b_idx.loc[start_date_ts:] / b_idx.loc[start_date_ts]) * start_val
+                for b_name, b_idx in benchmark_daily_indices.items() if not b_idx.loc[start_date_ts:].empty
+            }
             combined_growth = pd.concat([results['daily_value_index'], pd.DataFrame(norm_bench)], axis=1)
             combined_growth.columns.values[0] = name
             st.line_chart(combined_growth)
@@ -340,6 +308,8 @@ if run_button:
             fund_trailing['Weight'] = results['allocations'].iloc[:, -1]
             fund_trailing.index = fund_trailing.index.map(fund_names_map)
             final_cols = ['Weight'] + [c for c in TRAILING_COLS_ORDER if c in fund_trailing.columns]
+            # ROBUSTNESS: Remove duplicate columns before styling
+            fund_trailing = fund_trailing.loc[:, ~fund_trailing.columns.duplicated()]
             st.dataframe(style_table(fund_trailing[final_cols].style, '{:.2%}', 'N/A', excel_cmap, 'Weight'), use_container_width=True)
             
             st.markdown("##### **Portfolio vs. Benchmarks**")
@@ -348,29 +318,9 @@ if run_button:
             bench_trailing = pd.DataFrame({b_name: calculate_trailing_returns(b_idx) for b_name, b_idx in norm_bench.items()}).T
             combined_trailing = pd.concat([port_trailing.to_frame().T, bench_trailing])
             final_cols = [c for c in TRAILING_COLS_ORDER if c in combined_trailing.columns]
+            # ROBUSTNESS: Remove duplicate columns before styling
+            combined_trailing = combined_trailing.loc[:, ~combined_trailing.columns.duplicated()]
             st.dataframe(style_table(combined_trailing[final_cols].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
-
-            st.markdown("---")
-            st.subheader("📅 Calendar Year Performance (Year-on-Year)")
-            st.markdown("##### **Individual Funds**")
-            yoy_fund = results['yoy_fund_returns'].T.mul(100)
-            if not yoy_fund.empty:
-                yoy_fund.index = yoy_fund.index.map(fund_names_map)
-                yoy_fund.columns = [c.strftime('%Y') for c in yoy_fund.columns]
-                yoy_fund = yoy_fund.iloc[:, 1:]
-            if not yoy_fund.empty and not yoy_fund.columns.empty:
-                st.dataframe(style_table(yoy_fund.style, '{:.2f}%', 'N/A', excel_cmap), use_container_width=True)
-
-            st.markdown("##### **Portfolio vs. Benchmarks**")
-            yoy_port = results['yoy_portfolio_returns'].mul(100)
-            yoy_port.name = f"📊 {name} Portfolio"
-            yoy_bench = results['yoy_benchmark_returns'].T.mul(100)
-            combined_yoy = pd.concat([yoy_port.to_frame().T, yoy_bench])
-            if not combined_yoy.empty:
-                combined_yoy.columns = [c.strftime('%Y') for c in combined_yoy.columns]
-                combined_yoy = combined_yoy.iloc[:, 1:]
-            if not combined_yoy.empty and not combined_yoy.columns.empty:
-                st.dataframe(style_table(combined_yoy.style, '{:.2f}%', 'N/A', excel_cmap), use_container_width=True)
 
             st.markdown("---")
             st.subheader("✅ Performance Between Rebalancing Dates (Periodic Returns)")
@@ -378,18 +328,21 @@ if run_button:
             df_periodic = results['periodic_fund_returns'].mul(100)
             df_periodic['Weight'] = results['allocations'].iloc[:, -1]
             df_periodic.index = df_periodic.index.map(fund_names_map)
-            new_cols = [c.strftime('%d-%b-%Y') if isinstance(c, pd.Timestamp) else c for c in df_periodic.columns]
-            df_periodic.columns = new_cols
+            df_periodic.columns = [c.strftime('%d-%b-%Y') if isinstance(c, pd.Timestamp) else c for c in df_periodic.columns]
             if 'Weight' in df_periodic.columns:
                 cols = df_periodic.columns.tolist()
                 cols.insert(0, cols.pop(cols.index('Weight')))
                 df_periodic = df_periodic[cols]
+            # --- CRASH FIX: Remove duplicate columns right before styling ---
+            df_periodic = df_periodic.loc[:, ~df_periodic.columns.duplicated()]
             st.dataframe(style_table(df_periodic.style, '{:.2f}%', 'None', excel_cmap, 'Weight'), use_container_width=True)
 
             st.markdown("##### **Portfolio vs. Benchmarks (Periodic)**")
             port_periodic = results['periodic_portfolio_returns'].mul(100)
             port_periodic.name = f"📊 {name} Portfolio"
-            bench_periodic = results['benchmark_periodic_returns'].T.mul(100)
+            bench_periodic = results['benchmark_periodic_returns'].mul(100)
             combined_periodic = pd.concat([port_periodic.to_frame().T, bench_periodic])
             combined_periodic.columns = [c.strftime('%d-%b-%Y') for c in combined_periodic.columns]
+            # ROBUSTNESS: Remove duplicate columns before styling
+            combined_periodic = combined_periodic.loc[:, ~combined_periodic.columns.duplicated()]
             st.dataframe(style_table(combined_periodic.style, '{:.2f}%', 'None', excel_cmap), use_container_width=True)
