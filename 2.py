@@ -72,49 +72,58 @@ def _fetch_full_nav_history(scheme_codes_tuple):
     progress_bar.empty()
     return all_nav_history
 
-# --- NEW, CORRECTED CALCULATION FUNCTION ---
+# --- FINAL, CORRECTED CALCULATION FUNCTION ---
 def calculate_trailing_returns(series):
+    """
+    Calculates trailing returns with industry-standard logic:
+    - Absolute returns for periods < 1 year.
+    - Annualized (CAGR) returns for periods >= 1 year.
+    """
     returns = {}
     series = series.sort_index().dropna()
-    if len(series) < 2: return pd.Series(dtype=float)
+    if len(series) < 2:
+        return pd.Series(dtype=float)
+
     end_date, end_value = series.index[-1], series.iloc[-1]
 
-    first_day_of_month = datetime(end_date.year, end_date.month, 1)
-    last_day_of_previous_month = first_day_of_month - relativedelta(days=1)
-    last_day_of_previous_year = pd.to_datetime(f'{end_date.year - 1}-12-31')
-
-    special_periods = {
-        'MTD': last_day_of_previous_month,
-        'YTD': last_day_of_previous_year
-    }
-
-    for name, target_date in special_periods.items():
-        try:
-            pos = series.index.get_indexer([target_date], method='pad')[0]
-            if pos != -1 and series.index[pos] < end_date:
-                returns[name] = (end_value / series.iloc[pos]) - 1
-        except (IndexError, KeyError):
-            continue
-
     periods = {
-        '1 Month': relativedelta(months=1), '3 Months': relativedelta(months=3),
-        '6 Months': relativedelta(months=6), '1 Year': relativedelta(years=1),
-        '3 Years': relativedelta(years=3), '5 Years': relativedelta(years=5)
+        'MTD': (datetime(end_date.year, end_date.month, 1) - relativedelta(days=1)),
+        'YTD': pd.to_datetime(f'{end_date.year - 1}-12-31'),
+        '1 Month': end_date - relativedelta(months=1),
+        '3 Months': end_date - relativedelta(months=3),
+        '6 Months': end_date - relativedelta(months=6),
+        '1 Year': end_date - relativedelta(years=1),
+        '3 Years': end_date - relativedelta(years=3),
+        '5 Years': end_date - relativedelta(years=5)
     }
-    for name, delta in periods.items():
+
+    for name, target_date in periods.items():
         try:
-            target_date = end_date - delta
+            # Find the NAV at or just before the target date
             pos = series.index.get_indexer([target_date], method='pad')[0]
-            if pos != -1 and series.index[pos] < end_date:
-                start_val, start_date = series.iloc[pos], series.index[pos]
-                days = (end_date - start_date).days
-                if ('Year' in name or 'Years' in name) and days > 200:
-                    returns[name] = ((end_value / start_val) ** (365.25 / days)) - 1
-                else:
-                    returns[name] = (end_value / start_val) - 1
-        except (IndexError, KeyError):
-            continue
             
+            # Ensure the found date is before the end date
+            if pos != -1 and series.index[pos] < end_date:
+                start_value = series.iloc[pos]
+                start_date = series.index[pos]
+
+                # --- The Core Logic ---
+                # Annualize ONLY for periods of 1 year or more
+                is_annualized_period = any(x in name for x in ['Year', 'Years'])
+                
+                if is_annualized_period:
+                    days_in_period = (end_date - start_date).days
+                    if days_in_period > 0:
+                        cagr = ((end_value / start_value) ** (365.25 / days_in_period)) - 1
+                        returns[name] = cagr
+                else:
+                    # For all other periods, calculate absolute return
+                    absolute_return = (end_value / start_value) - 1
+                    returns[name] = absolute_return
+        
+        except (IndexError, KeyError, ZeroDivisionError):
+            continue  # Skip if calculation is not possible
+
     return pd.Series(returns)
 
 def style_table(styler, format_str, na_rep, cmap, weight_col=None):
