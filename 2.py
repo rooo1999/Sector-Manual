@@ -30,7 +30,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- Helper Functions ---
 
-# MODIFIED: New function to read from a public Google Sheet
 @st.cache_data(ttl="1h", show_spinner="Loading portfolio allocation data...")
 def read_portfolios_from_google_sheet(sheet_id):
     """Reads all sheets from a public Google Sheet and cleans them up."""
@@ -162,7 +161,6 @@ def style_table(styler, format_str, na_rep, cmap, weight_col=None):
     styler.applymap_index(lambda v: 'text-align: left;', axis='index')
     return styler
 
-# --- OPTIMIZATION: Main Calculation Function ---
 @st.cache_data(show_spinner="Calculating portfolio performance...")
 def perform_full_analysis(_all_portfolios_data_original, _all_navs_df, _start_date, _end_date, _initial_investment):
     """
@@ -181,7 +179,6 @@ def perform_full_analysis(_all_portfolios_data_original, _all_navs_df, _start_da
             skipped_portfolios.append(name)
 
     if not all_portfolios_data:
-        # Return empty results and the skipped list to be handled by the UI
         return {}, {}, skipped_portfolios
 
     navs_df_filtered = _all_navs_df.loc[start_ts:end_ts]
@@ -276,7 +273,7 @@ except Exception as e:
 
 if all_portfolios_data_original:
     all_fund_codes = set(code for p in all_portfolios_data_original.values() for code in p.index)
-    all_scheme_codes = tuple(sorted(list(all_fund_codes | set(BENCHMARKS.values())))) # OPTIMIZATION: Sorted for consistent caching
+    all_scheme_codes = tuple(sorted(list(all_fund_codes | set(BENCHMARKS.values()))))
     
     full_nav_history = _fetch_full_nav_history(all_scheme_codes)
     all_navs_df = pd.DataFrame(full_nav_history).ffill().bfill()
@@ -311,7 +308,6 @@ if run_button:
         st.error("Error: End date must be on or after start date.")
         st.stop()
     
-    # --- OPTIMIZATION: Call the cached function ---
     portfolio_results, benchmark_daily_indices, skipped_portfolios = perform_full_analysis(
         all_portfolios_data_original, all_navs_df, start_date, end_date, initial_investment
     )
@@ -323,7 +319,6 @@ if run_button:
         st.warning("No portfolios with sufficient data in the selected date range. Please select a wider range or check the data source.")
         st.stop()
     
-    # --- UI Rendering (Now much faster) ---
     excel_cmap = LinearSegmentedColormap.from_list("excel_like", ["#f8696b", "#ffeb84", "#63be7b"])
     
     tab_names = ["📈 Comparison"] + list(portfolio_results.keys())
@@ -423,13 +418,29 @@ if run_button:
             st.subheader("✅ Performance Between Rebalancing Dates (Periodic Returns)")
             st.info("This section shows the returns calculated between the specific dates in your uploaded file.")
             
+            # --- START: THE FINAL, CORRECTED SECTION ---
             st.markdown("##### **Individual Funds (Periodic)**")
+            
             df_fund_periodic = results['periodic_fund_returns'].mul(100)
-            df_fund_periodic.columns = [c.strftime('%b-%Y') for c in df_fund_periodic.columns]
-            df_fund_periodic.index = df_fund_periodic.index.map(fund_names_map)
-            # BUG FIX: Assigning the Series directly, not its .values
             df_fund_periodic['Weight'] = results['allocations'].iloc[:, -1]
+            
+            df_fund_periodic.index = df_fund_periodic.index.map(fund_names_map)
+            
+            new_columns = []
+            for c in df_fund_periodic.columns:
+                if isinstance(c, pd.Timestamp):
+                    new_columns.append(c.strftime('%b-%Y'))
+                else:
+                    new_columns.append(c) 
+            df_fund_periodic.columns = new_columns
+
+            if 'Weight' in df_fund_periodic.columns:
+                cols = df_fund_periodic.columns.tolist()
+                cols.insert(0, cols.pop(cols.index('Weight')))
+                df_fund_periodic = df_fund_periodic[cols]
+
             st.dataframe(style_table(df_fund_periodic.style, '{:.2f}%', 'None', excel_cmap, 'Weight'), use_container_width=True)
+            # --- END: THE FINAL, CORRECTED SECTION ---
 
             st.markdown("##### **Portfolio vs. Benchmarks (Periodic)**")
             portfolio_periodic = results['periodic_portfolio_returns'].mul(100)
