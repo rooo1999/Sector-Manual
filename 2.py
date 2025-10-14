@@ -179,7 +179,7 @@ with st.sidebar:
     st.markdown("---"); st.header("2. Set Date Range")
     
     # --- CHANGE: Set default start date to 2019-01-01 or later ---
-    desired_start_date = date(2019, 1, 1)
+    desired_start_date = date(2018, 12, 30)
     safe_default_start_date = max(api_min, desired_start_date)
     start_date = st.date_input("Start Date", value=safe_default_start_date, min_value=api_min, max_value=api_max, on_change=mark_rerun_required)
 
