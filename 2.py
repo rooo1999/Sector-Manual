@@ -177,9 +177,15 @@ with st.sidebar:
     initial_investment = st.number_input("1. Initial Investment", 1.0, value=10000.0, step=1000.0, on_change=mark_rerun_required)
     api_min, api_max = all_navs_df.index.min().date(), all_navs_df.index.max().date()
     st.markdown("---"); st.header("2. Set Date Range")
-    start_date = st.date_input("Start Date", api_min, api_min, api_max, on_change=mark_rerun_required)
+    
+    # --- CHANGE: Set default start date to 2019-01-01 or later ---
+    desired_start_date = date(2019, 1, 1)
+    safe_default_start_date = max(api_min, desired_start_date)
+    start_date = st.date_input("Start Date", value=safe_default_start_date, min_value=api_min, max_value=api_max, on_change=mark_rerun_required)
+
     safe_end_date = min(date.today(), api_max)
-    end_date = st.date_input("End Date", safe_end_date, api_min, api_max, on_change=mark_rerun_required)
+    end_date = st.date_input("End Date", value=safe_end_date, min_value=api_min, max_value=api_max, on_change=mark_rerun_required)
+    
     st.markdown("---")
     run_button = st.button("📊 Run Analysis", type="primary", use_container_width=True)
 
@@ -267,14 +273,10 @@ if 'portfolio_results' in st.session_state and st.session_state.portfolio_result
         st.markdown("##### **Benchmarks**"); df_b = st.session_state.benchmark_mom; df_b.columns = df_b.columns.strftime('%b-%Y')
         st.dataframe(style_table(df_b.style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
         
-        # --- REMOVED CHART ---
-
     for i, name in enumerate(portfolio_results.keys()):
         with tabs[i+1]:
             data = ui_data[name]
             st.header(f"Performance Analysis for: {name}")
-
-            # --- REMOVED CHART ---
             
             st.markdown("---")
             st.subheader("✅ Performance (Trailing Returns)")
