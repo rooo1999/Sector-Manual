@@ -17,7 +17,7 @@ TRAILING_COLS_ORDER = ['MTD', 'YTD', '1 Month', '3 Months', '6 Months', '1 Year'
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 
 
-# --- Helper Functions (No changes in this section) ---
+# --- Helper Functions ---
 def calculate_monthly_returns(series):
     return series.resample('M').last().pct_change()
 
@@ -72,28 +72,49 @@ def _fetch_full_nav_history(scheme_codes_tuple):
     progress_bar.empty()
     return all_nav_history
 
+# --- NEW, CORRECTED CALCULATION FUNCTION ---
 def calculate_trailing_returns(series):
     returns = {}
     series = series.sort_index().dropna()
     if len(series) < 2: return pd.Series(dtype=float)
     end_date, end_value = series.index[-1], series.iloc[-1]
-    special_periods = {'MTD': datetime(end_date.year, end_date.month, 1), 'YTD': pd.to_datetime(f'{end_date.year - 1}-12-31')}
+
+    first_day_of_month = datetime(end_date.year, end_date.month, 1)
+    last_day_of_previous_month = first_day_of_month - relativedelta(days=1)
+    last_day_of_previous_year = pd.to_datetime(f'{end_date.year - 1}-12-31')
+
+    special_periods = {
+        'MTD': last_day_of_previous_month,
+        'YTD': last_day_of_previous_year
+    }
+
     for name, target_date in special_periods.items():
         try:
             pos = series.index.get_indexer([target_date], method='pad')[0]
             if pos != -1 and series.index[pos] < end_date:
                 returns[name] = (end_value / series.iloc[pos]) - 1
-        except (IndexError, KeyError): continue
-    periods = {'1 Month': relativedelta(months=1), '3 Months': relativedelta(months=3), '6 Months': relativedelta(months=6), '1 Year': relativedelta(years=1), '3 Years': relativedelta(years=3), '5 Years': relativedelta(years=5)}
+        except (IndexError, KeyError):
+            continue
+
+    periods = {
+        '1 Month': relativedelta(months=1), '3 Months': relativedelta(months=3),
+        '6 Months': relativedelta(months=6), '1 Year': relativedelta(years=1),
+        '3 Years': relativedelta(years=3), '5 Years': relativedelta(years=5)
+    }
     for name, delta in periods.items():
         try:
-            pos = series.index.get_indexer([end_date - delta], method='pad')[0]
+            target_date = end_date - delta
+            pos = series.index.get_indexer([target_date], method='pad')[0]
             if pos != -1 and series.index[pos] < end_date:
                 start_val, start_date = series.iloc[pos], series.index[pos]
                 days = (end_date - start_date).days
-                if 'Year' in name and days > 200: returns[name] = ((end_value / start_val) ** (365.25 / days)) - 1
-                else: returns[name] = (end_value / start_val) - 1
-        except (IndexError, KeyError): continue
+                if ('Year' in name or 'Years' in name) and days > 200:
+                    returns[name] = ((end_value / start_val) ** (365.25 / days)) - 1
+                else:
+                    returns[name] = (end_value / start_val) - 1
+        except (IndexError, KeyError):
+            continue
+            
     return pd.Series(returns)
 
 def style_table(styler, format_str, na_rep, cmap, weight_col=None):
@@ -177,15 +198,11 @@ with st.sidebar:
     initial_investment = st.number_input("1. Initial Investment", 1.0, value=10000.0, step=1000.0, on_change=mark_rerun_required)
     api_min, api_max = all_navs_df.index.min().date(), all_navs_df.index.max().date()
     st.markdown("---"); st.header("2. Set Date Range")
-    
-    # --- CHANGE: Set default start date to 2019-01-01 or later ---
-    desired_start_date = date(2018, 12, 30)
+    desired_start_date = date(2019, 1, 1)
     safe_default_start_date = max(api_min, desired_start_date)
     start_date = st.date_input("Start Date", value=safe_default_start_date, min_value=api_min, max_value=api_max, on_change=mark_rerun_required)
-
     safe_end_date = min(date.today(), api_max)
     end_date = st.date_input("End Date", value=safe_end_date, min_value=api_min, max_value=api_max, on_change=mark_rerun_required)
-    
     st.markdown("---")
     run_button = st.button("📊 Run Analysis", type="primary", use_container_width=True)
 
@@ -201,7 +218,6 @@ if should_run:
             all_portfolios_data_original, all_navs_df, start_date, end_date, initial_investment
         )
         st.session_state.portfolio_results = results
-        
         if skipped_d: st.warning(f"Skipped (date range): **{', '.join(skipped_d)}**")
         if skipped_n: st.warning(f"Skipped (no NAVs): **{', '.join(skipped_n)}**")
         if dropped:
@@ -210,29 +226,22 @@ if should_run:
             names_map_dropped = get_names_from_codes(all_dropped_codes)
             for name, codes in dropped.items():
                 st.markdown(f"- **{name}**: {', '.join([names_map_dropped.get(c, c) for c in codes])}")
-        
         if results:
             all_codes = tuple(set(c for res in results.values() for c in res['allocations'].index))
             names_map = get_names_from_codes(all_codes)
             st.session_state.names_map = names_map
-
             st.session_state.comparison_trailing = pd.concat([pd.DataFrame({n: r['portfolio_trailing_returns'] for n, r in results.items()}).T, pd.DataFrame({n: calculate_trailing_returns(s) for n, s in bench_indices.items()}).T])
             st.session_state.portfolio_mom = pd.DataFrame({n: calculate_monthly_returns(r['daily_value_index']) for n, r in results.items()}).T
             st.session_state.benchmark_mom = pd.DataFrame({n: calculate_monthly_returns(s) for n, s in bench_indices.items()}).T
-            
             ui_data = {}
             for name, res in results.items():
                 start_ts = res['daily_value_index'].index.min()
-                
                 norm_bench = {b_name: (b_idx.loc[start_ts:] / b_idx.loc[start_ts]) * res['daily_value_index'].iloc[0] for b_name, b_idx in bench_indices.items() if not b_idx.loc[start_ts:].empty}
-                
                 fund_trailing = res['fund_trailing_returns'].copy()
                 fund_trailing['Weight'] = res['allocations'].iloc[:, -1]
                 fund_trailing.index = fund_trailing.index.map(names_map)
-                
                 port_trailing = res['portfolio_trailing_returns']; port_trailing.name = name
                 bench_trailing = pd.DataFrame({b_name: calculate_trailing_returns(b_idx) for b_name, b_idx in norm_bench.items()}).T
-                
                 df_periodic = res['periodic_fund_returns'].copy()
                 df_periodic['Weight'] = res['allocations'].iloc[:, -1]
                 df_periodic.index = df_periodic.index.map(names_map)
@@ -241,10 +250,8 @@ if should_run:
                 if 'Weight' in cols:
                     cols.insert(0, cols.pop(cols.index('Weight')))
                     df_periodic = df_periodic[cols]
-
                 port_periodic = res['periodic_portfolio_returns'].mul(100); port_periodic.name = f"📊 {name} Portfolio"
                 bench_periodic = res['benchmark_periodic_returns'].mul(100)
-                
                 ui_data[name] = {
                     'fund_trailing_df': fund_trailing,
                     'portfolio_vs_bench_trailing_df': pd.concat([port_trailing.to_frame().T, bench_trailing]),
@@ -258,9 +265,7 @@ if 'portfolio_results' in st.session_state and st.session_state.portfolio_result
     excel_cmap = LinearSegmentedColormap.from_list("excel_like", ["#f8696b", "#ffeb84", "#63be7b"])
     portfolio_results = st.session_state.portfolio_results
     ui_data = st.session_state.ui_data
-    
     tabs = st.tabs(["📈 Comparison"] + list(portfolio_results.keys()))
-
     with tabs[0]:
         st.header("Overall Portfolio Comparison")
         st.subheader("Trailing Returns Comparison")
@@ -272,12 +277,10 @@ if 'portfolio_results' in st.session_state and st.session_state.portfolio_result
         st.dataframe(style_table(df_p.style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
         st.markdown("##### **Benchmarks**"); df_b = st.session_state.benchmark_mom; df_b.columns = df_b.columns.strftime('%b-%Y')
         st.dataframe(style_table(df_b.style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
-        
     for i, name in enumerate(portfolio_results.keys()):
         with tabs[i+1]:
             data = ui_data[name]
             st.header(f"Performance Analysis for: {name}")
-            
             st.markdown("---")
             st.subheader("✅ Performance (Trailing Returns)")
             st.markdown("##### **Individual Funds**")
@@ -286,7 +289,6 @@ if 'portfolio_results' in st.session_state and st.session_state.portfolio_result
             st.markdown("##### **Portfolio vs. Benchmarks**")
             final_cols_ct = [c for c in TRAILING_COLS_ORDER if c in data['portfolio_vs_bench_trailing_df'].columns]
             st.dataframe(style_table(data['portfolio_vs_bench_trailing_df'][final_cols_ct].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
-            
             st.markdown("---")
             st.subheader("✅ Performance Between Rebalancing Dates (Periodic Returns)")
             st.markdown("##### **Individual Funds (Periodic)**")
