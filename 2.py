@@ -281,7 +281,7 @@ if run_button or not st.session_state.analysis_run:
                 daily_value_index.loc[current_date] = holdings_value.loc[current_date].sum()
             daily_value_index = daily_value_index.dropna()
 
-            portfolio_trailing_returns = calculate_trailing_returns(daily_value_index)
+            # --- Periodic Returns Calculation (for individual tab) ---
             rebal_dates = allocations.columns
             periodic_navs = navs_df_filtered.reindex(rebal_dates, method='ffill')
             periodic_fund_returns = periodic_navs.loc[:, allocations.index].pct_change()
@@ -289,37 +289,46 @@ if run_button or not st.session_state.analysis_run:
             periodic_portfolio_returns = (begin_allocs.T * periodic_fund_returns).sum(axis=1, min_count=1)
             benchmark_periodic_returns = periodic_navs.loc[:, BENCHMARKS.values()].pct_change()
             benchmark_periodic_returns.columns = BENCHMARKS.keys()
+            
+            # --- Trailing Fund Returns Calculation (for individual tab) ---
             fund_daily_indices = (1 + portfolio_fund_returns).cumprod() * initial_investment
             fund_trailing_returns = fund_daily_indices.apply(calculate_trailing_returns, axis=0).T
-            years_in_range = range(earliest_date.year, latest_date.year + 1)
-            year_end_targets = [pd.to_datetime(f'{year}-12-31') for year in years_in_range]
-            current_year = latest_date.year
-            if current_year in years_in_range and latest_date.strftime('%Y-%m-%d') != f'{current_year}-12-31':
-                current_year_index = list(years_in_range).index(current_year)
-                year_end_targets[current_year_index] = latest_date
-            year_end_targets = sorted(list(set(year_end_targets)))
-            yoy_navs = navs_df_filtered.reindex(year_end_targets, method='pad').dropna(how='all')
-            yoy_fund_returns = yoy_navs[allocations.index].pct_change()
-            yoy_allocations = daily_target_allocations.reindex(yoy_navs.index, method='pad')
-            begin_year_allocs = yoy_allocations.shift(1)
-            yoy_portfolio_returns = (yoy_fund_returns * begin_year_allocs).sum(axis=1, min_count=1)
-            yoy_benchmark_returns = yoy_navs[list(BENCHMARKS.values())].pct_change()
-            yoy_benchmark_returns.columns = BENCHMARKS.keys()
             
+            # --- Store Results for each portfolio ---
             portfolio_results[name] = {
-                'allocations': allocations, 'daily_value_index': daily_value_index, 'portfolio_trailing_returns': portfolio_trailing_returns,
-                'periodic_fund_returns': periodic_fund_returns.T, 'periodic_portfolio_returns': periodic_portfolio_returns, 'benchmark_periodic_returns': benchmark_periodic_returns,
-                'fund_trailing_returns': fund_trailing_returns, 'yoy_fund_returns': yoy_fund_returns, 'yoy_portfolio_returns': yoy_portfolio_returns, 'yoy_benchmark_returns': yoy_benchmark_returns
+                'allocations': allocations, 
+                'daily_value_index': daily_value_index,
+                'periodic_fund_returns': periodic_fund_returns.T, 
+                'periodic_portfolio_returns': periodic_portfolio_returns, 
+                'benchmark_periodic_returns': benchmark_periodic_returns,
+                'fund_trailing_returns': fund_trailing_returns
             }
+        
+        # --- UNIFIED & CONSISTENT CALCULATIONS (THE SINGLE SOURCE OF TRUTH) ---
+        # 1. Combine all daily portfolio values into one DataFrame
+        all_portfolio_indices = pd.concat({name: res['daily_value_index'] for name, res in portfolio_results.items()}, axis=1)
 
-        benchmark_daily_indices = {}
+        # 2. Create a single DataFrame for all benchmark daily values
+        benchmark_daily_indices = pd.DataFrame()
         unified_date_range = pd.date_range(start=earliest_date, end=latest_date, freq='D')
         for b_name, b_code in BENCHMARKS.items():
             if b_code in all_daily_returns:
                 b_returns = all_daily_returns[b_code].reindex(unified_date_range).fillna(0)
-                b_index = (1 + b_returns).cumprod().fillna(1) * initial_investment
-                benchmark_daily_indices[b_name] = b_index
-    
+                benchmark_daily_indices[b_name] = (1 + b_returns).cumprod().fillna(1) * initial_investment
+
+        # 3. Calculate all Trailing Returns from the unified data
+        portfolios_trailing_df = all_portfolio_indices.apply(calculate_trailing_returns).T
+        benchmarks_trailing_df = benchmark_daily_indices.apply(calculate_trailing_returns).T
+
+        # 4. Calculate all YOY Returns from the unified data
+        portfolios_yoy_df = all_portfolio_indices.resample('YE').last().pct_change().iloc[1:]
+        benchmarks_yoy_df = benchmark_daily_indices.resample('YE').last().pct_change().iloc[1:]
+        
+        # 5. Calculate all MOM Returns from the unified data
+        portfolios_mom_df = all_portfolio_indices.resample('ME').last().pct_change().iloc[1:, :]
+        benchmarks_mom_df = benchmark_daily_indices.resample('ME').last().pct_change().iloc[1:, :]
+
+
     # --- UI Rendering ---
     tab_names = ["📈 Comparison"] + list(portfolio_results.keys())
     tabs = st.tabs(tab_names)
@@ -329,54 +338,44 @@ if run_button or not st.session_state.analysis_run:
 
         # --- Trailing Returns ---
         st.subheader("Trailing Returns: Portfolios")
-        comparison_df = pd.DataFrame({name: res['portfolio_trailing_returns'] for name, res in portfolio_results.items()}).T
-        final_cols_comparison = [c for c in TRAILING_COLS_ORDER if c in comparison_df.columns]
-        st.dataframe(style_table(comparison_df[final_cols_comparison].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
+        final_cols_trailing = [c for c in TRAILING_COLS_ORDER if c in portfolios_trailing_df.columns]
+        st.dataframe(style_table(portfolios_trailing_df[final_cols_trailing].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
 
         st.subheader("Trailing Returns: Benchmarks")
-        benchmarks_trailing_comparison = pd.DataFrame(benchmark_daily_indices).apply(calculate_trailing_returns).T
-        final_cols_bench_trailing = [c for c in TRAILING_COLS_ORDER if c in benchmarks_trailing_comparison.columns]
-        st.dataframe(style_table(benchmarks_trailing_comparison[final_cols_bench_trailing].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
+        final_cols_bench_trailing = [c for c in TRAILING_COLS_ORDER if c in benchmarks_trailing_df.columns]
+        st.dataframe(style_table(benchmarks_trailing_df[final_cols_bench_trailing].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
         st.markdown("---")
 
         # --- Year-on-Year Returns ---
         st.subheader("Calendar Year (YOY) Performance")
-        
         st.markdown("##### **Portfolio Comparison (YOY)**")
-        all_portfolio_indices = pd.concat({name: res['daily_value_index'] for name, res in portfolio_results.items()}, axis=1)
-        yoy_portfolio_returns = all_portfolio_indices.resample('YE').last().pct_change().iloc[1:]
-        if not yoy_portfolio_returns.empty:
-            yoy_portfolio_returns.index = yoy_portfolio_returns.index.strftime('%Y')
-            st.dataframe(style_table(yoy_portfolio_returns.T.style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
+        if not portfolios_yoy_df.empty:
+            portfolios_yoy_df.index = portfolios_yoy_df.index.strftime('%Y')
+            st.dataframe(style_table(portfolios_yoy_df.T.style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
         else:
             st.info("Not enough data for a full year-on-year portfolio comparison.")
             
         st.markdown("##### **Benchmark Comparison (YOY)**")
-        all_benchmark_indices = pd.DataFrame(benchmark_daily_indices)
-        yoy_benchmark_returns = all_benchmark_indices.resample('YE').last().pct_change().iloc[1:]
-        if not yoy_benchmark_returns.empty:
-            yoy_benchmark_returns.index = yoy_benchmark_returns.index.strftime('%Y')
-            st.dataframe(style_table(yoy_benchmark_returns.T.style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
+        if not benchmarks_yoy_df.empty:
+            benchmarks_yoy_df.index = benchmarks_yoy_df.index.strftime('%Y')
+            st.dataframe(style_table(benchmarks_yoy_df.T.style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
         else:
             st.info("Not enough data for a full year-on-year benchmark comparison.")
         st.markdown("---")
 
         # --- Month-on-Month Returns ---
         st.subheader("Monthly (MOM) Performance (Last 12 Months)")
-
         st.markdown("##### **Portfolio Comparison (MOM)**")
-        mom_portfolio_returns = all_portfolio_indices.resample('ME').last().pct_change().iloc[1:, :]
-        if not mom_portfolio_returns.empty:
-            mom_portfolio_returns.index = mom_portfolio_returns.index.strftime('%b-%Y')
-            st.dataframe(style_table(mom_portfolio_returns.T.iloc[:, -12:].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
+        if not portfolios_mom_df.empty:
+            portfolios_mom_df.index = portfolios_mom_df.index.strftime('%b-%Y')
+            st.dataframe(style_table(portfolios_mom_df.T.iloc[:, -12:].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
         else:
             st.info("Not enough data for a month-on-month portfolio comparison.")
 
         st.markdown("##### **Benchmark Comparison (MOM)**")
-        mom_benchmark_returns = all_benchmark_indices.resample('ME').last().pct_change().iloc[1:, :]
-        if not mom_benchmark_returns.empty:
-            mom_benchmark_returns.index = mom_benchmark_returns.index.strftime('%b-%Y')
-            st.dataframe(style_table(mom_benchmark_returns.T.iloc[:, -12:].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
+        if not benchmarks_mom_df.empty:
+            benchmarks_mom_df.index = benchmarks_mom_df.index.strftime('%b-%Y')
+            st.dataframe(style_table(benchmarks_mom_df.T.iloc[:, -12:].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
         else:
             st.info("Not enough data for a month-on-month benchmark comparison.")
 
@@ -385,9 +384,6 @@ if run_button or not st.session_state.analysis_run:
         with tabs[i+1]:
             st.header(f"Performance Analysis for: {name}")
             fund_names_map = get_names_from_codes(results['allocations'].index.tolist())
-            
-            portfolio_start_date_tab = results['daily_value_index'].index.min()
-            filtered_benchmark_indices = {b_name: b_index.loc[portfolio_start_date_tab:] for b_name, b_index in benchmark_daily_indices.items()}
             
             st.subheader("✅ Performance (Trailing Returns)")
             st.markdown("##### **Individual Funds**")
@@ -398,37 +394,21 @@ if run_button or not st.session_state.analysis_run:
             st.dataframe(style_table(fund_trailing_returns_display[final_cols_trailing_funds].style, '{:.2%}', 'N/A', excel_cmap, 'Weight'), use_container_width=True)
             
             st.markdown("##### **Portfolio vs. Benchmarks**")
-            portfolio_trailing_returns = results['portfolio_trailing_returns']
-            portfolio_trailing_returns.name = name
-            benchmarks_trailing = pd.DataFrame(filtered_benchmark_indices).apply(calculate_trailing_returns).T
-            combined_trailing = pd.concat([portfolio_trailing_returns.to_frame().T, benchmarks_trailing])
-            final_cols_trailing = [c for c in TRAILING_COLS_ORDER if c in combined_trailing.columns]
+            # Combine this portfolio's trailing returns with the consistent, globally calculated benchmark returns
+            portfolio_trailing = portfolios_trailing_df.loc[[name]]
+            combined_trailing = pd.concat([portfolio_trailing, benchmarks_trailing_df])
             st.dataframe(style_table(combined_trailing[final_cols_trailing].style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
 
             st.markdown("---")
             st.subheader("📅 Calendar Year Performance (Year-on-Year)")
-            
-            st.markdown("##### **Individual Funds**")
-            yoy_fund_df = results['yoy_fund_returns'].T.mul(100)
-            if not yoy_fund_df.empty:
-                yoy_fund_df.index = yoy_fund_df.index.map(fund_names_map)
-                yoy_fund_df.columns = [c.strftime('%Y') for c in yoy_fund_df.columns]
-                yoy_fund_df = yoy_fund_df.iloc[:, 1:]
-            if not yoy_fund_df.empty and not yoy_fund_df.columns.empty:
-                st.dataframe(style_table(yoy_fund_df.style, '{:.2f}%', 'N/A', excel_cmap), use_container_width=True)
-            else:
-                st.info("Not enough data for a full year-on-year comparison for individual funds.")
-
             st.markdown("##### **Portfolio vs. Benchmarks**")
-            yoy_portfolio = results['yoy_portfolio_returns'].mul(100)
-            yoy_portfolio.name = f"📊 {name} Portfolio"
-            yoy_benchmarks = results['yoy_benchmark_returns'].T.mul(100)
-            combined_yoy = pd.concat([yoy_portfolio.to_frame().T, yoy_benchmarks])
-            if not combined_yoy.empty:
-                combined_yoy.columns = [c.strftime('%Y') for c in combined_yoy.columns]
-                combined_yoy = combined_yoy.iloc[:, 1:]
+            # Combine this portfolio's YOY returns with the consistent, globally calculated benchmark returns
+            portfolio_yoy = portfolios_yoy_df[[name]].T
+            portfolio_yoy.index.name = name
+            combined_yoy = pd.concat([portfolio_yoy, benchmarks_yoy_df.T])
+            
             if not combined_yoy.empty and not combined_yoy.columns.empty:
-                st.dataframe(style_table(combined_yoy.style, '{:.2f}%', 'N/A', excel_cmap), use_container_width=True)
+                 st.dataframe(style_table(combined_yoy.style, '{:.2%}', 'N/A', excel_cmap), use_container_width=True)
             else:
                 st.info("Not enough data for a full year-on-year comparison for Portfolio vs. Benchmarks.")
 
