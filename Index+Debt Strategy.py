@@ -5,7 +5,7 @@ import plotly.express as px
 import os
 from datetime import date
 
-st.set_page_config(page_title="Advanced Strategy Backtester", layout="wide")
+st.set_page_config(page_title="Advanced Basket Strategy", layout="wide")
 
 # --- DATA LOADER ---
 DEFAULT_PATH = r"D:\MIRA Money\Data I've Analyzed\Individual Sheets\Index Data for Strategy.xlsx"
@@ -32,26 +32,24 @@ def load_data(uploaded_file=None):
         df = df.ffill().dropna()
     return df
 
-# --- STRATEGY ENGINES ---
+# --- CALCULATIONS ---
 
 def run_fixed_allocation(df_slice, weights_dict, rebalance_freq):
     assets = list(weights_dict.keys())
     returns = df_slice[assets].pct_change().dropna()
     if returns.empty: return None
     
-    idx = returns.index
-    n = len(idx)
     vals = np.array([100.0 * weights_dict[a] for a in assets])
-    hist, dates = [100.0], [idx[0]]
-    
+    hist, dates = [100.0], [returns.index[0]]
     ret_arr = returns.values
     target_w = np.array([weights_dict[a] for a in assets])
     
     is_daily = rebalance_freq == "Daily"
     is_monthly = rebalance_freq == "Monthly"
     is_yearly = rebalance_freq == "Yearly"
+    idx = returns.index
     
-    for i in range(1, n):
+    for i in range(1, len(idx)):
         vals = vals * (1 + ret_arr[i])
         total = np.sum(vals)
         
@@ -68,129 +66,173 @@ def run_fixed_allocation(df_slice, weights_dict, rebalance_freq):
         
     return pd.Series(hist, index=dates, name="Strategy")
 
-def run_trend_following(df_slice, risky_asset, safe_asset, ma_period=200):
+def run_basket_trend(df_slice, risky_weights, safe_asset, ma_period):
     """
-    If Risky Asset > Moving Average: 100% Risky
-    Else: 100% Safe
+    1. Construct Synthetic Risky Asset (Daily Rebalanced Basket)
+    2. Calc MA on Synthetic
+    3. Switch between Synthetic Return and Safe Return
     """
-    # Calculate MA
-    prices = df_slice[risky_asset]
-    ma_series = prices.rolling(window=ma_period).mean()
+    risky_assets = list(risky_weights.keys())
     
-    # Combined DF
-    data = pd.DataFrame({
-        'Risky': df_slice[risky_asset],
-        'Safe': df_slice[safe_asset],
-        'MA': ma_series
-    }).dropna()
+    # Get Returns
+    all_assets = risky_assets + [safe_asset]
+    returns = df_slice[all_assets].pct_change().dropna()
     
-    if data.empty: return None
+    if returns.empty: return None
     
-    # Calculate returns
-    risky_ret = data['Risky'].pct_change()
-    safe_ret = data['Safe'].pct_change()
+    # 1. Create Synthetic Risky Return Series (Daily Rebalanced)
+    # This represents how your "Equity Basket" performs day-to-day
+    risky_daily_ret = pd.Series(0.0, index=returns.index)
+    for asset, weight in risky_weights.items():
+        risky_daily_ret += returns[asset] * weight
+        
+    # 2. Create Synthetic NAV (to calculate MA)
+    synthetic_nav = (1 + risky_daily_ret).cumprod() * 100
+    synthetic_ma = synthetic_nav.rolling(window=ma_period).mean()
     
-    # Signal (Shifted by 1 day to avoid lookahead bias)
-    # If today Close > MA, tomorrow we are in Equity
-    signal = (data['Risky'] > data['MA']).shift(1)
+    # 3. Generate Signal
+    # Signal = Previous Day NAV > Previous Day MA
+    # We shift by 1 to avoid lookahead bias (decision made on yesterday's close)
+    signal = (synthetic_nav > synthetic_ma).shift(1)
     
-    # Logic
-    # If Signal is True (1) -> Use Risky Ret, Else -> Use Safe Ret
-    # If signal is NaN (first row), assume Safe
-    strat_ret = np.where(signal == True, risky_ret, safe_ret)
+    # 4. Apply Strategy
+    # If Signal True (Bullish) -> Get Risky Basket Return
+    # If Signal False (Bearish) -> Get Safe Asset Return
+    # If Signal NaN (Start) -> Get Safe Asset Return
     
-    # Calculate NAV
-    # Replace NaN in first row with 0
-    strat_ret = np.nan_to_num(strat_ret, nan=0.0)
+    safe_ret = returns[safe_asset]
     
-    nav = (1 + strat_ret).cumprod() * 100
-    return pd.Series(nav, index=data.index, name="Strategy")
+    # Vectorized condition
+    strategy_daily_ret = np.where(signal == True, risky_daily_ret, safe_ret)
+    
+    # Handle NaNs at start (due to MA window) by defaulting to 0 or safe
+    strategy_daily_ret = np.nan_to_num(strategy_daily_ret, nan=0.0)
+    
+    # Calculate Final Strategy NAV
+    strat_nav = (1 + strategy_daily_ret).cumprod() * 100
+    
+    return pd.Series(strat_nav, index=returns.index, name="Strategy")
 
-# --- UI ---
-st.sidebar.header("Data")
-f = st.sidebar.file_uploader("Upload", type=['xlsx','csv'])
+# --- UI SETUP ---
+st.sidebar.header("Data Configuration")
+f = st.sidebar.file_uploader("Upload File", type=['xlsx','csv'])
 df = load_data(f)
-if df is None: st.stop()
+
+if df is None: 
+    st.info("Please upload data.")
+    st.stop()
 
 cols = df.columns.tolist()
 
-# --- STRATEGY SELECTION ---
-st.sidebar.header("Strategy Settings")
-strat_type = st.sidebar.selectbox("Strategy Type", ["Fixed Allocation (Buy & Hold)", "Trend Following (Timing)"])
+# --- STRATEGY UI ---
+st.sidebar.header("Strategy Logic")
+mode = st.sidebar.selectbox("Mode", ["Fixed Allocation (Passive)", "Trend Following (Active Switch)"])
 
-if strat_type == "Fixed Allocation (Buy & Hold)":
-    sel_assets = st.sidebar.multiselect("Select Assets", cols, default=cols[:2])
-    weights = {}
-    if not sel_assets: st.stop()
-    for a in sel_assets:
-        weights[a] = st.sidebar.number_input(f"{a} %", 0, 100, int(100/len(sel_assets))) / 100.0
-    freq = st.sidebar.selectbox("Rebalance", ["Daily","Monthly","Yearly","Never"])
+# Common Weights Input Function
+def get_weights(label_suffix=""):
+    st.sidebar.markdown(f"**Select {label_suffix} Assets:**")
+    assets = st.sidebar.multiselect(f"Assets {label_suffix}", cols, key=f"ms_{label_suffix}")
+    w = {}
+    if not assets: return None
     
-else:
-    st.sidebar.info("Switch to Debt when Market crashes.")
-    risky = st.sidebar.selectbox("Risky Asset (Equity)", cols, index=0)
-    safe = st.sidebar.selectbox("Safe Asset (Debt/Liquid)", cols, index=1)
-    ma_days = st.sidebar.number_input("Moving Average Days", value=200)
+    total = 0
+    st.sidebar.markdown("Define Weights:")
+    c = st.sidebar.columns(1)
+    for a in assets:
+        val = st.sidebar.number_input(f"{a} %", 0, 100, int(100/len(assets)), key=f"num_{a}_{label_suffix}")
+        w[a] = val/100.0
+        total += val
+        
+    if total != 100:
+        st.sidebar.error(f"Total {total}%. Must be 100%.")
+        return None
+    return w
 
-# --- BENCHMARK ---
+# Mode Specific Inputs
+weights_input = None
+safe_asset = None
+ma_days = 200
+
+if mode == "Fixed Allocation (Passive)":
+    weights_input = get_weights("(Portfolio)")
+    freq = st.sidebar.selectbox("Rebalancing", ["Daily", "Monthly", "Yearly", "Never"])
+else:
+    st.sidebar.info("Construct your 'Risky Basket'. If this basket drops below MA, we switch to Safe Asset.")
+    risky_weights = get_weights("(Risky Basket)")
+    
+    st.sidebar.markdown("**Select Safe Asset:**")
+    # Smart default for debt
+    debt_candidates = [c for c in cols if "Money" in c or "Liquid" in c or "Debt" in c]
+    def_debt = debt_candidates[0] if debt_candidates else cols[0]
+    safe_asset = st.sidebar.selectbox("Safe Asset (Cash/Debt)", cols, index=cols.index(def_debt))
+    
+    ma_days = st.sidebar.number_input("MA Days", value=200)
+
+# Benchmark
 bench = st.sidebar.selectbox("Benchmark", cols, index=0)
 
-# --- DATES ---
+# Dates
 min_d, max_d = df.index.min().date(), df.index.max().date()
 s_date = st.sidebar.date_input("Start", max(min_d, date(2014,1,1)))
 e_date = st.sidebar.date_input("End", max_d)
 
-# --- RUN ---
+# --- EXECUTION ---
 mask = (df.index.date >= s_date) & (df.index.date <= e_date)
-df_s = df.loc[mask]
+df_slice = df.loc[mask]
 
-if strat_type == "Fixed Allocation (Buy & Hold)":
-    if sum(weights.values()) != 1.0: st.error("Weights != 100%"); st.stop()
-    res = run_fixed_allocation(df_s, weights, freq)
+if df_slice.empty: st.stop()
+
+if mode == "Fixed Allocation (Passive)":
+    if not weights_input: st.stop()
+    res_series = run_fixed_allocation(df_slice, weights_input, freq)
 else:
-    res = run_trend_following(df_s, risky, safe, ma_days)
+    if not risky_weights: st.stop()
+    res_series = run_basket_trend(df_slice, risky_weights, safe_asset, ma_days)
 
-if res is None: st.error("Not enough data"); st.stop()
+if res_series is None: 
+    st.error("Insufficient Data")
+    st.stop()
 
 # Align Bench
-b_series = df_s[bench].loc[res.index]
+b_series = df_slice[bench].loc[res_series.index]
 b_series = (b_series / b_series.iloc[0]) * 100
-final = pd.DataFrame({'Strategy': res, 'Benchmark': b_series})
 
-# --- DISPLAY ---
-st.title(f"{strat_type} Results")
+final = pd.DataFrame({'Strategy': res_series, 'Benchmark': b_series})
 
-# Metrics
+# --- METRICS & CHARTS ---
+st.title(f"{mode} Backtest")
+
 years = (final.index[-1] - final.index[0]).days / 365.25
 cagr = lambda s: (s.iloc[-1]/s.iloc[0])**(1/years)-1
 vol = lambda s: s.pct_change().std() * np.sqrt(252)
+dd = lambda s: (s/s.cummax()-1).min()
 
-sc, bc = cagr(final['Strategy']), cagr(final['Benchmark'])
-sv, bv = vol(final['Strategy']), vol(final['Benchmark'])
+s_c, b_c = cagr(final['Strategy']), cagr(final['Benchmark'])
+s_v, b_v = vol(final['Strategy']), vol(final['Benchmark'])
+s_d, b_d = dd(final['Strategy']), dd(final['Benchmark'])
 
-c1,c2,c3,c4 = st.columns(4)
-c1.metric("Strategy CAGR", f"{sc:.2%}")
-c2.metric("Benchmark CAGR", f"{bc:.2%}", delta=f"{(sc-bc)*100:.2f}")
-c3.metric("Strategy Vol", f"{sv:.2%}")
-c4.metric("Benchmark Vol", f"{bv:.2%}", delta=f"{(sv-bv)*100:.2f}", delta_color="inverse")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("CAGR", f"{s_c:.2%}", f"{(s_c-b_c)*100:.2f} pts")
+m2.metric("Vol", f"{s_v:.2%}", f"{(s_v-b_v)*100:.2f} pts", delta_color="inverse")
+m3.metric("Max Drawdown", f"{s_d:.2%}")
+m4.metric("Sharpe", f"{s_c/s_v:.2f}")
 
 st.plotly_chart(px.line(final, title="Performance"), use_container_width=True)
 
-t1, t2 = st.tabs(["Yearly Returns", "Monthly Heatmap"])
+# TABS
+t1, t2 = st.tabs(["Yearly", "Monthly Heatmap"])
 with t1:
     y = final.resample('YE').last().pct_change()
     # Fix first year
-    first_year = final.index[0].year
-    first_val = final.resample('YE').last().iloc[0]
-    y.iloc[0] = (first_val / 100) - 1
-    
+    f_val = final.resample('YE').last().iloc[0]
+    y.iloc[0] = (f_val/100) - 1
     y['Alpha'] = y['Strategy'] - y['Benchmark']
     y.index = y.index.year
     st.dataframe(y.style.format("{:.2%}").background_gradient(cmap='RdYlGn', subset=['Strategy','Alpha']), use_container_width=True)
 
 with t2:
     m = final['Strategy'].resample('ME').apply(lambda x: x.iloc[-1]/x.iloc[0]-1 if len(x)>0 else 0)
-    piv = pd.DataFrame({'Y':m.index.year, 'M':m.index.strftime('%b'), 'V':m.values}).pivot(index='Y', columns='M', values='V')
-    piv = piv.reindex(columns=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'])
-    piv['YTD'] = final['Strategy'].resample('YE').apply(lambda x: x.iloc[-1]/x.iloc[0]-1).values
-    st.dataframe(piv.style.format("{:.2%}", na_rep="-").background_gradient(cmap='RdYlGn', axis=None), use_container_width=True)
+    p = pd.DataFrame({'Y':m.index.year, 'M':m.index.strftime('%b'), 'V':m.values}).pivot(index='Y', columns='M', values='V')
+    p = p.reindex(columns=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'])
+    p['YTD'] = final['Strategy'].resample('YE').apply(lambda x: x.iloc[-1]/x.iloc[0]-1).values
+    st.dataframe(p.style.format("{:.2%}", na_rep="-").background_gradient(cmap='RdYlGn', axis=None), use_container_width=True)
