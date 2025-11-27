@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import os
 from datetime import date
 
-st.set_page_config(page_title="Strategy Debugger", layout="wide")
+st.set_page_config(page_title="MA Crossover Strategy", layout="wide")
 
 # --- 1. DATA LOADER ---
 DEFAULT_PATH = r"D:\MIRA Money\Data I've Analyzed\Individual Sheets\Index Data for Strategy.xlsx"
@@ -38,7 +38,6 @@ def load_data(uploaded_file=None):
 
 def get_basket_nav(df, weights):
     assets = list(weights.keys())
-    # Ensure we only use rows where we have data
     valid_df = df[assets].dropna()
     returns = valid_df.pct_change().fillna(0)
     
@@ -60,123 +59,88 @@ def get_basket_nav(df, weights):
         
     return pd.Series(hist, index=dates, name="Risky_Basket")
 
-def calculate_ma(series, window, ma_type):
-    # FORCE INT to prevent crashes
-    window = int(window)
-    if ma_type == "EMA (Exponential)":
-        return series.ewm(span=window, adjust=False).mean()
-    else:
-        return series.rolling(window=window, min_periods=1).mean()
-
-def run_strategy(df_full, risky_weights, safe_asset, buffer_pct, start_date, end_date, ma_type, ma_window):
+def run_crossover_strategy(df_full, risky_weights, safe_asset, fast_period, slow_period, ma_type, start_date, end_date):
     
-    # 1. Full History Basket
+    # 1. Build Basket (Full History)
     risky_nav = get_basket_nav(df_full, risky_weights)
     
-    # 2. Full History MA
-    ma_series = calculate_ma(risky_nav, ma_window, ma_type)
+    # 2. Calculate MAs (Full History)
+    if ma_type == "EMA":
+        fast_ma = risky_nav.ewm(span=fast_period, adjust=False).mean()
+        slow_ma = risky_nav.ewm(span=slow_period, adjust=False).mean()
+    else:
+        fast_ma = risky_nav.rolling(window=fast_period, min_periods=1).mean()
+        slow_ma = risky_nav.rolling(window=slow_period, min_periods=1).mean()
     
-    # 3. Logic Loop
-    price = risky_nav.values
-    ma = ma_series.values
-    
-    signals = []
-    state = 1 
-    
-    buffer_mult = buffer_pct / 100.0
-    
-    for i in range(len(price)):
-        p = price[i]
-        m = ma[i]
-        
-        # Handle start logic safely
-        if np.isnan(m):
-            signals.append(True)
-            continue
-            
-        upper = m * (1 + buffer_mult)
-        lower = m * (1 - buffer_mult)
-        
-        if state == 1:
-            if p < lower:
-                state = 0
-        else:
-            if p > upper:
-                state = 1
-                
-        signals.append(bool(state))
-        
-    raw_signal = pd.Series(signals, index=risky_nav.index)
-    
-    # 4. Shift Signal
+    # 3. Logic: Invested if Fast > Slow
+    # Shift(1) to avoid lookahead
+    raw_signal = (fast_ma > slow_ma)
     trade_signal = raw_signal.shift(1).fillna(True)
     
-    # 5. Slicing
+    # 4. Slice Data
     mask = (df_full.index.date >= start_date) & (df_full.index.date <= end_date)
     df_slice = df_full.loc[mask]
     
-    if df_slice.empty: return None, None, None, None, None
+    if df_slice.empty: return None, None, None, None, None, None
 
-    # Slice Everything
-    risky_nav_sliced = risky_nav.loc[mask]
-    trade_signal_sliced = trade_signal.loc[mask]
-    ma_series_sliced = ma_series.loc[mask]
+    risky_nav = risky_nav.loc[mask]
+    trade_signal = trade_signal.loc[mask]
+    fast_ma = fast_ma.loc[mask]
+    slow_ma = slow_ma.loc[mask]
     
-    # --- VISUALIZATION REBASING ---
-    # We rebase Price to 100. We must rebase MA by the exact same factor to keep them aligned.
-    rebase_factor = 100 / risky_nav_sliced.iloc[0]
+    # Rebase for Viz
+    rebase = 100 / risky_nav.iloc[0]
+    risky_viz = risky_nav * rebase
+    fast_viz = fast_ma * rebase
+    slow_viz = slow_ma * rebase
     
-    risky_viz = risky_nav_sliced * rebase_factor
-    ma_viz = ma_series_sliced * rebase_factor
-    
-    # 6. Returns
-    risky_ret = risky_nav_sliced.pct_change().fillna(0)
+    # 5. Returns
+    risky_ret = risky_nav.pct_change().fillna(0)
     safe_ret = df_slice[safe_asset].pct_change().fillna(0)
     
-    final_ret = np.where(trade_signal_sliced, risky_ret, safe_ret)
+    final_ret = np.where(trade_signal, risky_ret, safe_ret)
     strat_nav = (1 + final_ret).cumprod() * 100
     strat_series = pd.Series(strat_nav, index=df_slice.index, name="Strategy")
     
-    return strat_series, risky_viz, ma_viz, trade_signal_sliced, df_slice
+    return strat_series, risky_viz, fast_viz, slow_viz, trade_signal, df_slice
 
 def analyze_trades(signal_series, strategy_nav):
-    # Convert to INT to ensure diff works correctly (True-False can vary by version)
+    # Convert to int
     sig_int = signal_series.astype(int)
     trades = sig_int.diff().fillna(0)
     
     entries = trades[trades == 1].index
     exits = trades[trades == -1].index
     
-    # Handle Start
-    if sig_int.iloc[0] == 1:
-        entries = entries.insert(0, sig_int.index[0])
+    # Handle Start/End
+    if sig_int.iloc[0] == 1: entries = entries.insert(0, sig_int.index[0])
+    if sig_int.iloc[-1] == 1: exits = exits.append(pd.Index([sig_int.index[-1]]))
         
-    # Handle End
-    if sig_int.iloc[-1] == 1:
-        exits = exits.append(pd.Index([sig_int.index[-1]]))
-        
-    # Align
     n = min(len(entries), len(exits))
-    entries = entries[:n]
-    exits = exits[:n]
+    entries, exits = entries[:n], exits[:n]
     
     log = []
+    total_days_held = 0
+    
     for en, ex in zip(entries, exits):
         try:
             val_in = strategy_nav.loc[en]
             val_out = strategy_nav.loc[ex]
             ret = (val_out/val_in) - 1
             days = (ex - en).days
+            total_days_held += days
+            
             log.append({
                 "Entry": en.date(),
                 "Exit": ex.date(),
-                "Days": days,
+                "Days Held": days,
                 "Return": ret,
                 "Status": "Win" if ret > 0 else "Loss"
             })
         except: pass
         
-    return pd.DataFrame(log)
+    avg_hold = total_days_held / n if n > 0 else 0
+    return pd.DataFrame(log), avg_hold
 
 # --- 3. UI ---
 st.sidebar.header("1. Input")
@@ -185,7 +149,7 @@ df_raw = load_data(f)
 if df_raw is None: st.info(f"Load Data... {DEFAULT_PATH}"); st.stop()
 cols = df_raw.columns.tolist()
 
-st.sidebar.header("2. Composition")
+st.sidebar.header("2. Asset Config")
 st.sidebar.markdown("**Risky Basket**")
 assets = st.sidebar.multiselect("Select Assets", cols, default=cols[:2] if len(cols)>1 else cols)
 weights = {}
@@ -204,10 +168,13 @@ n_guess = [c for c in cols if "Nifty" in c and "50" in c]
 bench_col = st.sidebar.selectbox("Comparison", cols, index=cols.index(n_guess[0]) if n_guess else 0)
 
 # --- SETTINGS ---
-st.sidebar.header("3. Strategy Settings")
-ma_type = st.sidebar.selectbox("MA Type", ["EMA (Exponential)", "SMA (Simple)"], index=0)
-ma_window = st.sidebar.number_input("Period (Days)", value=50, step=10) # Default 50 per request
-buffer_pct = st.sidebar.slider("Hysteresis Buffer (%)", 0.0, 5.0, 0.0, 0.1) # Default 0.0 for sensitivity
+st.sidebar.header("3. Crossover Settings")
+ma_type = st.sidebar.selectbox("MA Type", ["EMA", "SMA"], index=0)
+c1, c2 = st.sidebar.columns(2)
+fast_p = c1.number_input("Fast MA (Green Line)", value=50, step=10, help="Entry Signal")
+slow_p = c2.number_input("Slow MA (Red Line)", value=200, step=10, help="Trend Baseline")
+
+st.sidebar.caption("Strategy: Buy when FAST > SLOW. Sell when FAST < SLOW.")
 
 st.sidebar.header("4. Dates")
 valid = df_raw.index
@@ -218,14 +185,14 @@ e_d = st.sidebar.date_input("End", valid.max().date())
 mask = (df_raw.index.date >= s_d) & (df_raw.index.date <= e_d)
 df_slice = df_raw.loc[mask]
 
-strat, r_viz, ma_viz, sigs, df_used = run_strategy(
-    df_raw, weights, safe_asset, buffer_pct, s_d, e_d, ma_type, ma_window
+strat, r_viz, fast_viz, slow_viz, sigs, df_used = run_crossover_strategy(
+    df_raw, weights, safe_asset, int(fast_p), int(slow_p), ma_type, s_d, e_d
 )
 
 if strat is None: st.error("No Data"); st.stop()
 
 # Stats
-t_log = analyze_trades(sigs, strat)
+t_log, avg_hold_days = analyze_trades(sigs, strat)
 bench = df_slice[bench_col]
 bench = (bench/bench.iloc[0])*100
 combined = pd.DataFrame({'Strategy': strat, 'Nifty 50': bench})
@@ -242,53 +209,58 @@ def metrics(s):
 sc, sv, sd = metrics(combined['Strategy'])
 bc, bv, bd = metrics(combined['Nifty 50'])
 
-st.title(f"{int(ma_window)} {ma_type.split(' ')[0]} Strategy Analysis")
+st.title(f"{fast_p}/{slow_p} {ma_type} Crossover Strategy")
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("CAGR", f"{sc:.2%}", f"{(sc-bc)*100:.2f} pts")
 col2.metric("Max Drawdown", f"{sd:.2%}", f"{(sd-bd)*100:.2f} pts", delta_color="inverse")
-col3.metric("Win Rate", f"{(len(t_log[t_log['Return']>0])/len(t_log) if len(t_log)>0 else 0):.0%}", f"{len(t_log)} Trades")
-col4.metric("Avg Trade Return", f"{(t_log['Return'].mean() if not t_log.empty else 0):.2%}")
+col3.metric("Trades", f"{len(t_log)}", f"Avg Hold: {int(avg_hold_days)} Days")
+col4.metric("Win Rate", f"{(len(t_log[t_log['Return']>0])/len(t_log) if len(t_log)>0 else 0):.0%}")
 
 # --- CHARTS ---
 st.subheader("Performance vs Benchmark")
 st.plotly_chart(px.line(combined, title="Growth of 100"), use_container_width=True)
 
-with st.expander("🔍 Signal Logic Chart (Why did we buy/sell?)", expanded=True):
-    # Calculate Bands
-    upper = ma_viz * (1 + buffer_pct/100)
-    lower = ma_viz * (1 - buffer_pct/100)
-    
+with st.expander("🔍 Crossover Visualization (The Golden Cross)", expanded=True):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=r_viz.index, y=r_viz, name="Basket Price", line=dict(color='blue')))
-    fig.add_trace(go.Scatter(x=ma_viz.index, y=ma_viz, name=f"MA {int(ma_window)}", line=dict(color='orange')))
+    fig.add_trace(go.Scatter(x=r_viz.index, y=r_viz, name="Price", line=dict(color='gray', width=1)))
+    fig.add_trace(go.Scatter(x=fast_viz.index, y=fast_viz, name=f"Fast MA ({fast_p})", line=dict(color='green', width=2)))
+    fig.add_trace(go.Scatter(x=slow_viz.index, y=slow_viz, name=f"Slow MA ({slow_p})", line=dict(color='red', width=2)))
     
-    if buffer_pct > 0:
-        fig.add_trace(go.Scatter(x=upper.index, y=upper, name="Buy Zone", line=dict(color='green', dash='dot')))
-        fig.add_trace(go.Scatter(x=lower.index, y=lower, name="Sell Zone", line=dict(color='red', dash='dot')))
+    # Shade zones
+    y_min = r_viz.min()
+    y_max = r_viz.max()
     
-    # Overlay Cash Zones
-    cash_mask = sigs == False
-    if cash_mask.any():
-        cash_df = r_viz[cash_mask]
-        fig.add_trace(go.Scatter(x=cash_df.index, y=[r_viz.min()]*len(cash_df), 
-                                 mode='markers', name="In Cash", marker=dict(color='red', symbol='square')))
-        
+    # We can visualize 'Invested' zones by coloring background or using marker lines
+    # Simple method: Dots on crossovers
+    crossovers = sigs.astype(int).diff()
+    buys = crossovers[crossovers == 1].index
+    sells = crossovers[crossovers == -1].index
+    
+    # Filter for view
+    buys = [b for b in buys if b >= s_d]
+    sells = [s for s in sells if s >= s_d]
+
+    # Add markers
+    # For accurate Y value, grab Fast MA value at that date
+    if buys:
+        buy_y = [fast_viz.loc[b] for b in buys]
+        fig.add_trace(go.Scatter(x=buys, y=buy_y, mode='markers', name="Golden Cross (Buy)", marker=dict(color='green', size=12, symbol='triangle-up')))
+    if sells:
+        sell_y = [fast_viz.loc[s] for s in sells]
+        fig.add_trace(go.Scatter(x=sells, y=sell_y, mode='markers', name="Death Cross (Sell)", marker=dict(color='red', size=12, symbol='triangle-down')))
+
     st.plotly_chart(fig, use_container_width=True)
 
-# --- DEBUG & LOGS ---
-tab1, tab2 = st.tabs(["Trade Log", "Yearly Returns"])
+# --- TABLES ---
+st.subheader("Yearly Returns")
+y_df = combined.resample('YE').last()
+s_row = pd.DataFrame([100,100], index=['Strategy','Nifty 50'], columns=[combined.index[0]-pd.Timedelta(days=1)]).T
+y_calc = pd.concat([s_row, y_df]).sort_index().pct_change().dropna()
+y_calc['Alpha'] = y_calc['Strategy'] - y_calc['Nifty 50']
+y_calc.index = y_calc.index.year
+st.dataframe(y_calc.style.format("{:.2%}").background_gradient(cmap='RdYlGn', subset=['Strategy','Alpha']), use_container_width=True)
 
-with tab1:
-    if not t_log.empty:
-        st.dataframe(t_log.style.format({"Return": "{:.2%}"}).background_gradient(cmap='RdYlGn', subset=['Return']), use_container_width=True)
-    else:
-        st.warning("1 Trade Detected (Buy & Hold). This usually means the trend was strong or buffer was too wide.")
-
-with tab2:
-    y_df = combined.resample('YE').last()
-    s_row = pd.DataFrame([100,100], index=['Strategy','Nifty 50'], columns=[combined.index[0]-pd.Timedelta(days=1)]).T
-    y_calc = pd.concat([s_row, y_df]).sort_index().pct_change().dropna()
-    y_calc['Alpha'] = y_calc['Strategy'] - y_calc['Nifty 50']
-    y_calc.index = y_calc.index.year
-    st.dataframe(y_calc.style.format("{:.2%}").background_gradient(cmap='RdYlGn', subset=['Strategy','Alpha']), use_container_width=True)
+st.subheader("Trade Log (Proof of Holding Period)")
+if not t_log.empty:
+    st.dataframe(t_log.style.format({"Return": "{:.2%}"}).background_gradient(cmap='RdYlGn', subset=['Return']), use_container_width=True)
