@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import os
 from datetime import date
 
-st.set_page_config(page_title="Regime Filter Pro", layout="wide")
+st.set_page_config(page_title="Hybrid Strategy Engine", layout="wide")
 
 # --- DATA LOADER ---
 DEFAULT_PATH = r"D:\MIRA Money\Data I've Analyzed\Individual Sheets\Index Data for Strategy.xlsx"
@@ -34,46 +34,7 @@ def load_data(uploaded_file=None):
         df = df.ffill().dropna()
     return df
 
-# --- ADVANCED SIGNAL LOGIC ---
-
-def calculate_buffered_signal(price_series, ma_series, entry_buffer_pct, exit_buffer_pct):
-    """
-    Generates signals with Hysteresis (Separate Entry/Exit).
-    Entry: Price > MA * (1 + entry_buffer)
-    Exit:  Price < MA * (1 - exit_buffer)
-    """
-    signals = []
-    
-    # Initial State: We assume Risk On (True) for the start (First 200 days)
-    # 1 = Invested (Risk On), 0 = Safe (Risk Off)
-    current_state = 1 
-    
-    prices = price_series.values
-    mas = ma_series.values
-    
-    for i in range(len(prices)):
-        p = prices[i]
-        m = mas[i]
-        
-        # Handle NaN MAs (First 200 days) -> Force Invested
-        if np.isnan(m):
-            signals.append(True)
-            continue
-            
-        # Define Bands
-        upper_band = m * (1 + entry_buffer_pct/100.0)
-        lower_band = m * (1 - exit_buffer_pct/100.0)
-        
-        if current_state == 1: # Currently Invested
-            if p < lower_band:
-                current_state = 0 # Sell Signal
-        else: # Currently in Cash
-            if p > upper_band:
-                current_state = 1 # Re-entry Signal
-                
-        signals.append(bool(current_state))
-        
-    return pd.Series(signals, index=price_series.index)
+# --- CORE LOGIC ---
 
 def construct_basket(df_full, weights_dict, rebalance_freq):
     assets = list(weights_dict.keys())
@@ -103,30 +64,82 @@ def construct_basket(df_full, weights_dict, rebalance_freq):
         
     return pd.Series(hist, index=dates, name="Basket_NAV")
 
+def calculate_hybrid_signal(bench_series, basket_series, ma_days):
+    """
+    Hybrid Logic:
+    - Entry: If Bench > Bench_MA
+    - Exit:  If Basket < Basket_MA
+    """
+    # 1. Calculate MAs
+    bench_ma = bench_series.rolling(window=ma_days, min_periods=1).mean()
+    basket_ma = basket_series.rolling(window=ma_days, min_periods=1).mean()
+    
+    # Values for loop
+    b_price = bench_series.values
+    b_ma = bench_ma.values
+    k_price = basket_series.values # k for basket
+    k_ma = basket_ma.values
+    
+    signals = []
+    # Default State: 1 (Invested) for the start
+    state = 1 
+    
+    for i in range(len(b_price)):
+        # Safety for NaNs
+        if np.isnan(b_ma[i]) or np.isnan(k_ma[i]):
+            signals.append(True)
+            continue
+            
+        if state == 1:
+            # We are Invested. Check EXIT condition (Basket based)
+            # Exit if Basket < Basket MA
+            if k_price[i] < k_ma[i]:
+                state = 0
+        else:
+            # We are in Cash. Check ENTRY condition (Benchmark based)
+            # Enter if Benchmark > Benchmark MA
+            if b_price[i] > b_ma[i]:
+                state = 1
+                
+        signals.append(bool(state))
+        
+    return pd.Series(signals, index=bench_series.index)
+
 def run_strategy_engine(df_full, mode, risky_weights, safe_asset, ma_days, rebal_freq, 
-                       start_date, end_date, signal_source_col, entry_buf, exit_buf):
+                       start_date, end_date, signal_source_col, signal_logic_type):
     
     # 1. Risky Basket
     risky_nav = construct_basket(df_full, risky_weights, rebal_freq)
     
-    # 2. Signal Generation (Full History)
-    if mode == "Trend Following" and signal_source_col:
-        signal_price = df_full[signal_source_col]
+    # 2. Benchmark Series (for Hybrid logic)
+    if signal_source_col:
+        bench_nav = df_full[signal_source_col]
     else:
-        signal_price = risky_nav
+        bench_nav = risky_nav # Fallback
+        
+    # 3. Generate Signals
+    if mode == "Fixed Allocation":
+        # Always True
+        trade_signal = pd.Series(True, index=risky_nav.index)
+    
+    elif signal_logic_type == "Hybrid (Entry: Benchmark / Exit: Basket)":
+        # --- NEW HYBRID LOGIC ---
+        raw_signal = calculate_hybrid_signal(bench_nav, risky_nav, ma_days)
+        # Shift 1 day to trade tomorrow
+        trade_signal = raw_signal.shift(1).fillna(True)
+        
+    else:
+        # --- STANDARD LOGIC (Single Source) ---
+        if signal_logic_type == "Broad Market (Nifty)":
+            sig_source = bench_nav
+        else: 
+            sig_source = risky_nav
+            
+        ma_series = sig_source.rolling(window=ma_days, min_periods=1).mean()
+        raw_signal = (sig_source > ma_series).shift(1).fillna(True)
+        trade_signal = raw_signal
 
-    # Calculate MA
-    ma_series = signal_price.rolling(window=ma_days, min_periods=1).mean()
-    
-    # Calculate Buffered Signals (Loop based)
-    # We shift(1) INSIDE the logic? No, we calculate state based on today's close, 
-    # then shift the RESULT by 1 to trade tomorrow.
-    raw_signal_series = calculate_buffered_signal(signal_price, ma_series, entry_buf, exit_buf)
-    
-    # Shift by 1 day to avoid lookahead (Trade on Next Open based on Today Close)
-    trade_signal = raw_signal_series.shift(1).fillna(True)
-    
-    # 3. Slice
+    # 4. Slice Data
     mask = (df_full.index.date >= start_date) & (df_full.index.date <= end_date)
     df_slice = df_full.loc[mask]
     
@@ -134,27 +147,19 @@ def run_strategy_engine(df_full, mode, risky_weights, safe_asset, ma_days, rebal
 
     risky_nav = risky_nav.loc[mask]
     trade_signal = trade_signal.loc[mask]
-    signal_price = signal_price.loc[mask]
-    ma_series = ma_series.loc[mask]
     
-    # Visual Rebase
-    risky_nav_viz = (risky_nav / risky_nav.iloc[0]) * 100
-    
-    # 4. Returns
+    # 5. Returns
     risky_ret = risky_nav.pct_change().fillna(0)
     safe_ret = df_slice[safe_asset].pct_change().fillna(0)
     
-    if mode == "Fixed Allocation":
-        final_ret = risky_ret 
-    else:
-        final_ret = np.where(trade_signal == True, risky_ret, safe_ret)
+    final_ret = np.where(trade_signal == True, risky_ret, safe_ret)
         
     strat_nav = (1 + final_ret).cumprod() * 100
     strat_series = pd.Series(strat_nav, index=df_slice.index, name="Strategy")
     
-    return strat_series, df_slice, trade_signal, signal_price, ma_series
+    return strat_series, df_slice, trade_signal, risky_nav, bench_nav
 
-# --- UI ---
+# --- UI SETUP ---
 st.sidebar.header("1. Data")
 f = st.sidebar.file_uploader("Upload", type=['xlsx','csv'])
 df_raw = load_data(f)
@@ -181,9 +186,8 @@ def get_weights(label):
 
 risky_weights = {}
 safe_asset = cols[0]
-signal_source = None
-entry_buf = 0.0
-exit_buf = 0.0
+signal_logic_type = "Self"
+signal_source_col = None
 ma_days = 200
 
 if mode == "Fixed Allocation":
@@ -199,25 +203,22 @@ else:
     
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Traffic Light Logic**")
-    sig_type = st.sidebar.radio("Signal Source", ["Broad Market (Nifty)", "Self (Basket)"])
-    if sig_type == "Broad Market (Nifty)":
+    
+    # New Hybrid Option Added
+    signal_logic_type = st.sidebar.radio("Logic Type", 
+                                         ["Hybrid (Entry: Benchmark / Exit: Basket)", 
+                                          "Broad Market (Nifty)", 
+                                          "Self (Basket Only)"])
+    
+    if "Benchmark" in signal_logic_type or "Broad Market" in signal_logic_type:
         n_guess = [c for c in cols if "Nifty" in c and "50" in c]
-        signal_source = st.sidebar.selectbox("Index", cols, index=cols.index(n_guess[0]) if n_guess else 0)
+        signal_source_col = st.sidebar.selectbox("Select Benchmark Index", cols, index=cols.index(n_guess[0]) if n_guess else 0)
     
-    c1, c2 = st.sidebar.columns(2)
-    ma_days = c1.number_input("DMA", 200)
-    
-    st.sidebar.markdown("**Buffers (Avoid Whipsaws)**")
-    c3, c4 = st.sidebar.columns(2)
-    entry_buf = c3.number_input("Entry Buffer (%)", 0.0, 10.0, 0.0, 0.5, help="Re-enter only if Price > DMA + X%")
-    exit_buf = c4.number_input("Exit Buffer (%)", 0.0, 10.0, 0.0, 0.5, help="Exit only if Price < DMA - X%")
-    
-    if entry_buf > 0 or exit_buf > 0:
-        st.sidebar.caption(f"Strategy: Buy > {ma_days}DMA + {entry_buf}%. Sell < {ma_days}DMA - {exit_buf}%.")
+    ma_days = st.sidebar.number_input("DMA Period", value=200)
 
 # Date
 st.sidebar.markdown("---")
-bench_col = st.sidebar.selectbox("Benchmark", cols, index=0)
+bench_comp_col = st.sidebar.selectbox("Comparison Benchmark", cols, index=0)
 valid = df_raw.index
 s_d = st.sidebar.date_input("Start", max(valid.min().date(), date(2014,1,1)))
 e_d = st.sidebar.date_input("End", valid.max().date())
@@ -225,13 +226,13 @@ e_d = st.sidebar.date_input("End", valid.max().date())
 # --- RUN ---
 if not risky_weights or sum(risky_weights.values()) != 1.0: st.stop()
 
-strat, df_s, sig_vec, sig_price, sig_ma = run_strategy_engine(
-    df_raw, mode, risky_weights, safe_asset, ma_days, rebal_freq, s_d, e_d, signal_source, entry_buf, exit_buf
+strat, df_s, sig_vec, risky_nav_viz, bench_nav_viz = run_strategy_engine(
+    df_raw, mode, risky_weights, safe_asset, ma_days, rebal_freq, s_d, e_d, signal_source_col, signal_logic_type
 )
 
 if strat is None: st.error("No Data"); st.stop()
 
-bench = df_s[bench_col]
+bench = df_s[bench_comp_col]
 bench = (bench/bench.iloc[0])*100
 final = pd.DataFrame({'Strategy': strat, 'Benchmark': bench})
 
@@ -258,44 +259,38 @@ k3.metric("Vol", f"{sv:.2%}", f"{(sv-bv)*100:.2f}", delta_color="inverse")
 st.subheader("Performance")
 st.plotly_chart(px.line(final, title="Growth of 100"), use_container_width=True)
 
-# --- TRAFFIC LIGHT CHART ---
+# --- VISUALS ---
 if mode == "Trend Following":
-    st.subheader("🚦 Traffic Light Analysis")
-    with st.expander("Show Signal Chart", expanded=True):
-        # We construct a DF with Raw Levels
-        sig_viz = pd.DataFrame({
-            'Market Price': sig_price,
-            f'{ma_days} DMA': sig_ma
-        })
+    with st.expander("🚦 Signal Diagnostic (Logic Visualizer)", expanded=True):
+        st.write(f"**Logic Used:** {signal_logic_type}")
         
-        # Add Buffer Lines for Visual Reference if buffers exist
-        if entry_buf > 0:
-            sig_viz['Buy Threshold'] = sig_ma * (1 + entry_buf/100)
-        if exit_buf > 0:
-            sig_viz['Sell Threshold'] = sig_ma * (1 - exit_buf/100)
-            
-        # Plot using Graph Objects for better control (Raw Levels)
-        fig_sig = go.Figure()
+        # Calculate MAs for Viz
+        basket_ma = risky_nav_viz.rolling(ma_days).mean()
         
-        # 1. Market Price
-        fig_sig.add_trace(go.Scatter(x=sig_viz.index, y=sig_viz['Market Price'], name=f"Price ({signal_source if signal_source else 'Basket'})", line=dict(color='blue')))
-        
-        # 2. DMA
-        fig_sig.add_trace(go.Scatter(x=sig_viz.index, y=sig_viz[f'{ma_days} DMA'], name=f"{ma_days} DMA", line=dict(color='orange', width=2)))
-        
-        # 3. Buffers
-        if entry_buf > 0:
-             fig_sig.add_trace(go.Scatter(x=sig_viz.index, y=sig_viz['Buy Threshold'], name="Buy Line", line=dict(color='green', dash='dot')))
-        if exit_buf > 0:
-             fig_sig.add_trace(go.Scatter(x=sig_viz.index, y=sig_viz['Sell Threshold'], name="Sell Line", line=dict(color='red', dash='dot')))
-
-        # 4. Background Color for Regime
-        # We can simulate this by shading areas, but for performance, let's keep it line based
-        fig_sig.update_layout(title="Signal Source: Raw Levels & Moving Averages", hovermode="x unified")
-        st.plotly_chart(fig_sig, use_container_width=True)
-        
-        # State Table
-        st.write(f"**Current State:** {'🟢 Equity (Risk On)' if sig_vec.iloc[-1] else '🔴 Cash (Risk Off)'}")
+        if signal_logic_type == "Hybrid (Entry: Benchmark / Exit: Basket)":
+             st.info("Blue Line = Basket (Used for Exit). Orange Line = Benchmark (Used for Entry).")
+             # Normalize both to start at 100 for comparison
+             b_norm = (risky_nav_viz / risky_nav_viz.iloc[0]) * 100
+             n_norm = (bench_nav_viz / bench_nav_viz.iloc[0]) * 100
+             
+             fig_hyb = go.Figure()
+             fig_hyb.add_trace(go.Scatter(x=b_norm.index, y=b_norm, name="Basket (Strategy)"))
+             fig_hyb.add_trace(go.Scatter(x=n_norm.index, y=n_norm, name="Benchmark (Entry Signal)"))
+             
+             # Overlay Signal State
+             # Identify where Signal is 0 (Cash)
+             cash_zones = sig_vec[sig_vec == False]
+             fig_hyb.add_trace(go.Scatter(x=cash_zones.index, y=[b_norm.min()]*len(cash_zones), 
+                                          mode='markers', name="In Cash", marker=dict(color='red', symbol='square')))
+             
+             st.plotly_chart(fig_hyb, use_container_width=True)
+             
+        else:
+            # Standard Plot
+            fig_sig = go.Figure()
+            fig_sig.add_trace(go.Scatter(x=risky_nav_viz.index, y=risky_nav_viz, name="Price"))
+            fig_sig.add_trace(go.Scatter(x=basket_ma.index, y=basket_ma, name=f"{ma_days} DMA"))
+            st.plotly_chart(fig_sig, use_container_width=True)
 
 # --- TABLES ---
 t1, t2 = st.tabs(["Heatmap", "Yearly"])
