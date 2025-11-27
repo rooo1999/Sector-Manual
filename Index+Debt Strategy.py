@@ -28,8 +28,10 @@ def load_data(uploaded_file=None):
 
     if df is not None:
         df.columns = df.columns.str.strip()
+        # Clean Date
         df.iloc[:,0] = pd.to_datetime(df.iloc[:,0], errors='coerce')
-        df = df.dropna(subset=[df.columns[0]]).rename(columns={df.columns[0]: 'Date'}).sort_values('Date').set_index('Date')
+        df = df.dropna(subset=[df.columns[0]])
+        df = df.rename(columns={df.columns[0]: 'Date'}).sort_values('Date').set_index('Date')
         df = df.ffill().dropna()
     return df
 
@@ -37,8 +39,7 @@ def load_data(uploaded_file=None):
 
 def construct_basket(df_full, weights_dict, rebalance_freq):
     """
-    Creates a synthetic index (NAV) for a basket of assets
-    starting from the beginning of the file (to maximize history).
+    Creates a synthetic index (NAV) for a basket of assets.
     """
     assets = list(weights_dict.keys())
     returns = df_full[assets].pct_change().fillna(0)
@@ -70,44 +71,44 @@ def construct_basket(df_full, weights_dict, rebalance_freq):
     return pd.Series(hist, index=dates, name="Basket_NAV")
 
 def run_strategy_engine(df_full, mode, risky_weights, safe_asset, ma_days, rebal_freq, start_date, end_date):
-    """
-    1. Generates Risky Basket from full history (to prep MA).
-    2. Calculates MA on full history.
-    3. Slices to user date range.
-    4. Executes Strategy.
-    """
-    # 1. Construct Risky Basket (The "Growth Engine")
+    
+    # 1. Construct Risky Basket on FULL data (to get max history)
     risky_nav = construct_basket(df_full, risky_weights, rebal_freq)
     
-    # 2. Calculate Signals on Full Data (Solves Cold Start)
-    ma_series = risky_nav.rolling(window=ma_days).mean()
+    # 2. Calculate Signals
+    # FIX: min_periods=1 ensures we get an MA even if we don't have 200 days yet
+    # This prevents the "First 200 Days Safe Asset" bug.
+    ma_series = risky_nav.rolling(window=ma_days, min_periods=1).mean()
     
-    # Signal: If NAV > MA = True (Equity). Else False (Debt).
-    # Shift(1) to avoid lookahead bias.
+    # Signal: Price > MA. Shift(1) to avoid lookahead.
     raw_signal = (risky_nav > ma_series).shift(1)
+    
+    # FIX: Fill initial NaN (Day 1) with True (Risk On) so we start invested
+    raw_signal = raw_signal.fillna(True)
     
     # 3. Slice Data to User Selection
     mask = (df_full.index.date >= start_date) & (df_full.index.date <= end_date)
     df_slice = df_full.loc[mask]
     
-    # Also slice the pre-calculated series
+    if df_slice.empty: return None, None
+
+    # Slice the pre-calculated series to match the view
     risky_nav = risky_nav.loc[mask]
     raw_signal = raw_signal.loc[mask]
     
-    if df_slice.empty: return None, None
-
+    # Rebase risky_nav to 100 for the start of THIS period (visual only)
+    risky_nav = (risky_nav / risky_nav.iloc[0]) * 100
+    
     # Get Returns for the specific period
+    # We calculate returns from the sliced data to ensure alignment
     risky_ret = risky_nav.pct_change().fillna(0)
     safe_ret = df_slice[safe_asset].pct_change().fillna(0)
     
     # 4. Apply Strategy Logic
     if mode == "Fixed Allocation":
-        # Just return the Risky Basket (which is already weighted)
-        # Note: If fixed allocation includes Debt in the basket, it's already handled in construct_basket
         final_ret = risky_ret 
     else:
-        # Trend Following: Switch between Risky Basket and Safe Asset
-        # np.where(condition, if_true, if_false)
+        # Vectorized Switch
         final_ret = np.where(raw_signal == True, risky_ret, safe_ret)
         
     # Calculate Strategy NAV
@@ -117,29 +118,37 @@ def run_strategy_engine(df_full, mode, risky_weights, safe_asset, ma_days, rebal
     return strat_series, df_slice
 
 # --- UI SETUP ---
-st.sidebar.header("Data")
-f = st.sidebar.file_uploader("Upload Data", type=['xlsx','csv'])
+st.sidebar.header("1. Upload Data")
+f = st.sidebar.file_uploader("Upload Excel/CSV", type=['xlsx','csv'])
 df_raw = load_data(f)
+
 if df_raw is None: 
-    st.info("Upload file to proceed.")
+    st.info(f"Waiting for data... (Default path: {DEFAULT_PATH})")
     st.stop()
+
+# --- DIAGNOSTICS ---
+file_start = df_raw.index.min().date()
+file_end = df_raw.index.max().date()
+
+st.info(f"📊 **Data Diagnostics:** File contains data from **{file_start}** to **{file_end}**.")
 
 cols = df_raw.columns.tolist()
 
 # --- CONFIGURATION ---
-st.sidebar.header("Strategy Settings")
+st.sidebar.header("2. Strategy Settings")
 mode = st.sidebar.selectbox("Strategy Mode", ["Trend Following (Dynamic)", "Fixed Allocation (Static)"])
 
-# Helper for weights
+# Helper
 def get_weights(label):
     st.sidebar.markdown(f"**{label}**")
     assets = st.sidebar.multiselect(f"Select Assets", cols, key=label)
     w_dict = {}
     if assets:
-        cols_ui = st.sidebar.columns(1)
+        # Default equal weights
+        def_w = 100/len(assets)
         total = 0
         for a in assets:
-            val = st.sidebar.number_input(f"{a} %", 0, 100, int(100/len(assets)), key=f"w_{a}_{label}")
+            val = st.sidebar.number_input(f"{a} %", 0, 100, int(def_w), key=f"w_{a}_{label}")
             w_dict[a] = val/100.0
             total += val
         if total != 100: st.sidebar.error("Weights must sum to 100%")
@@ -151,38 +160,41 @@ ma_days = 200
 rebal_freq = "Monthly"
 
 if mode == "Fixed Allocation (Static)":
-    st.sidebar.info("Construct a fixed portfolio.")
     risky_weights = get_weights("Portfolio Composition")
-    rebal_freq = st.sidebar.selectbox("Rebalancing Frequency", ["Daily","Monthly","Yearly","Never"])
+    rebal_freq = st.sidebar.selectbox("Rebalancing", ["Daily","Monthly","Yearly","Never"])
 else:
-    st.sidebar.info("1. Construct Risky Basket (Equity). \n2. Select Safe Asset (Debt). \n3. Logic: If Basket < MA, switch to Debt.")
-    risky_weights = get_weights("Step 1: Risky Basket (e.g. Mid + Small)")
-    rebal_freq = st.sidebar.selectbox("Risky Basket Rebalancing", ["Daily","Monthly","Yearly","Never"], index=1)
+    st.sidebar.markdown("### Risky Basket (Equity)")
+    risky_weights = get_weights("Select Equity Funds")
+    rebal_freq = st.sidebar.selectbox("Equity Basket Rebalancing", ["Daily","Monthly","Yearly","Never"], index=1)
     
-    st.sidebar.markdown("**Step 2: Safe Asset**")
-    # Auto-find debt
-    d_guess = [c for c in cols if "Money" in c or "Liquid" in c or "Debt" in c]
-    safe_asset = st.sidebar.selectbox("Defensive Fund", cols, index=cols.index(d_guess[0]) if d_guess else 0)
+    st.sidebar.markdown("### Safe Asset (Debt)")
+    # Auto-guess debt fund
+    d_guess = [c for c in cols if "Money" in c or "Liquid" in c or "Debt" in c or "Tata" in c]
+    d_idx = cols.index(d_guess[0]) if d_guess else 0
+    safe_asset = st.sidebar.selectbox("Select Safe Fund", cols, index=d_idx)
     
-    ma_days = st.sidebar.number_input("Moving Average (DMA)", value=200, help="Trend period. Lower = Faster switching.")
+    ma_days = st.sidebar.number_input("DMA (Trend Period)", value=200, help="Uses available data if history is short.")
 
 # Benchmark
-bench_col = st.sidebar.selectbox("Benchmark", cols, index=0)
+st.sidebar.markdown("### Benchmark")
+bench_col = st.sidebar.selectbox("Select Benchmark", cols, index=0)
 
 # Dates
-valid_dates = df_raw.index
-s_date = st.sidebar.date_input("Start Date", max(valid_dates.min().date(), date(2014,1,1)))
-e_date = st.sidebar.date_input("End Date", valid_dates.max().date())
+st.sidebar.markdown("### Backtest Period")
+# Default to 2014 or file start
+def_start = max(file_start, date(2014,1,1))
+s_date = st.sidebar.date_input("Start Date", def_start, min_value=file_start, max_value=file_end)
+e_date = st.sidebar.date_input("End Date", file_end, min_value=file_start, max_value=file_end)
 
 # --- EXECUTION ---
 if not risky_weights or sum(risky_weights.values()) != 1.0:
-    st.warning("Please configure assets and ensure weights sum to 100%.")
+    st.warning("⚠️ Please configure assets and ensure weights sum to 100% to run.")
     st.stop()
 
 strat_series, df_sliced = run_strategy_engine(df_raw, mode, risky_weights, safe_asset, ma_days, rebal_freq, s_date, e_date)
 
 if strat_series is None:
-    st.error("Error running strategy. Check dates.")
+    st.error("Error: Selected date range has no data.")
     st.stop()
 
 # Bench Setup
@@ -197,24 +209,23 @@ st.title("Strategy Analytics Dashboard")
 
 # 1. Calculator
 def get_stats(series):
+    if series.empty: return 0,0,0,0,0
     start_val = series.iloc[0]
     end_val = series.iloc[-1]
     years = (series.index[-1] - series.index[0]).days / 365.25
+    if years <= 0: return 0,0,0,0,0
     
     cagr = (end_val/start_val)**(1/years) - 1
     
-    # Volatility
     daily_ret = series.pct_change().dropna()
     vol = daily_ret.std() * np.sqrt(252)
     
-    # Drawdown
     roll_max = series.cummax()
     dd = (series - roll_max) / roll_max
     max_dd = dd.min()
     
-    # Sharpe (Rf=6% assumption for Indian context)
     rf = 0.06
-    sharpe = (cagr - rf) / vol
+    sharpe = (cagr - rf) / vol if vol != 0 else 0
     
     return cagr, vol, max_dd, sharpe, end_val
 
@@ -232,6 +243,7 @@ k5.metric("Final Value (of 100)", f"{s_end:.0f}", f"{s_end-b_end:.0f}")
 # 3. Main Chart
 st.subheader("Growth of ₹100")
 fig = px.line(final_df, title="")
+fig.update_layout(hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
 
 # 4. Detailed Stats Table
@@ -245,9 +257,10 @@ stats_data = {
 st.table(pd.DataFrame(stats_data))
 
 # 5. Drawdown Chart
-st.subheader("Drawdown Analysis (Risk)")
+st.subheader("Drawdown Analysis")
 dd_df = (final_df / final_df.cummax()) - 1
-fig_dd = px.area(dd_df, title="Underwater Plot (Depth of Losses)")
+fig_dd = px.area(dd_df, title="Underwater Plot (Loss Depth)")
+fig_dd.update_layout(hovermode="x unified")
 st.plotly_chart(fig_dd, use_container_width=True)
 
 # 6. Returns Heatmap
@@ -262,9 +275,7 @@ with t1:
     st.dataframe(piv.style.format("{:.2%}", na_rep="-").background_gradient(cmap='RdYlGn', axis=None), use_container_width=True)
 
 with t2:
-    # Accurate Yearly calc including partial years
     y_df = final_df.resample('YE').last()
-    # Add start row
     start_row = pd.DataFrame([100, 100], index=['Strategy','Benchmark'], columns=[final_df.index[0]-pd.Timedelta(days=1)]).T
     calc_df = pd.concat([start_row, y_df]).sort_index()
     y_ret = calc_df.pct_change().dropna()
