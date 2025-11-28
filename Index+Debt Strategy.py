@@ -2,265 +2,279 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 import os
 from datetime import date
 
-st.set_page_config(page_title="MA Crossover Strategy", layout="wide")
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="Multi-Asset Strategy Backtester", layout="wide")
 
-# --- 1. DATA LOADER ---
+# --- FILE LOADING LOGIC ---
 DEFAULT_PATH = r"D:\MIRA Money\Data I've Analyzed\Individual Sheets\Index Data for Strategy.xlsx"
 
 @st.cache_data
 def load_data(uploaded_file=None):
     df = None
-    if uploaded_file:
+    
+    if uploaded_file is not None:
         try:
-            if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file)
-            else: df = pd.read_excel(uploaded_file)
-        except: return None
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
+        except Exception as e:
+            st.error(f"Error loading uploaded file: {e}")
+            return None
     elif os.path.exists(DEFAULT_PATH):
         try:
-            if DEFAULT_PATH.endswith('.csv'): df = pd.read_csv(DEFAULT_PATH)
-            else: df = pd.read_excel(DEFAULT_PATH)
-        except: return None
-    else: return None
+            if DEFAULT_PATH.endswith('.csv'):
+                df = pd.read_csv(DEFAULT_PATH)
+            else:
+                df = pd.read_excel(DEFAULT_PATH)
+        except Exception as e:
+            st.warning(f"Found default file but could not load: {e}")
+            return None
+    else:
+        return None
 
     if df is not None:
+        # Clean Data
         df.columns = df.columns.str.strip()
-        df.iloc[:,0] = pd.to_datetime(df.iloc[:,0], errors='coerce')
-        df = df.dropna(subset=[df.columns[0]])
-        df = df.rename(columns={df.columns[0]: 'Date'}).sort_values('Date').set_index('Date')
+        date_col = df.columns[0]
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df = df.dropna(subset=[date_col])
+        df = df.rename(columns={date_col: 'Date'})
+        df = df.sort_values('Date')
+        df.set_index('Date', inplace=True)
+        # Forward fill to handle holidays/gaps, drop remaining NaNs
         df = df.ffill().dropna()
+        
     return df
 
-# --- 2. CALCULATIONS ---
+# --- BACKTEST ENGINE (MULTI-ASSET) ---
+def run_portfolio_backtest(df_slice, weights_dict, rebalance_freq):
+    """
+    weights_dict: {'Asset_Name': 0.50, 'Asset_Name_2': 0.30, ...} (Sum should be 1.0)
+    """
+    assets = list(weights_dict.keys())
+    
+    # Calculate daily returns for selected assets
+    returns = df_slice[assets].pct_change().dropna()
+    
+    if returns.empty:
+        return None
 
-def get_basket_nav(df, weights):
-    assets = list(weights.keys())
-    valid_df = df[assets].dropna()
-    returns = valid_df.pct_change().fillna(0)
+    # Align dates
+    date_index = returns.index
+    n_days = len(date_index)
     
-    vals = np.array([100.0 * weights[a] for a in assets])
-    hist = [100.0]
-    dates = [returns.index[0]]
-    ret_arr = returns.values
-    target_w = np.array([weights[a] for a in assets])
-    idx = returns.index
+    # Initial setup
+    current_value = 100.0
     
-    # Monthly Rebalancing
-    for i in range(1, len(idx)):
-        vals = vals * (1 + ret_arr[i])
-        total = np.sum(vals)
-        if idx[i].month != idx[i-1].month: 
-            vals = total * target_w
-        hist.append(total)
-        dates.append(idx[i])
+    # Current value of each component [Asset1_Val, Asset2_Val...]
+    # Initialize based on weights
+    component_values = np.array([current_value * weights_dict[a] for a in assets])
+    
+    # Store history
+    history = [current_value]
+    dates = [date_index[0]]
+    
+    # Convert returns to numpy array for speed: Shape (Rows, Cols)
+    ret_values = returns.values 
+    
+    # Map Rebalance Frequency
+    is_daily = rebalance_freq == "Daily"
+    is_monthly = rebalance_freq == "Monthly"
+    is_yearly = rebalance_freq == "Yearly"
+    is_never = "Never" in rebalance_freq
+    
+    # Target weights array
+    target_weights = np.array([weights_dict[a] for a in assets])
+
+    # Loop through days (starting from 2nd day relative to returns index)
+    for i in range(1, n_days):
+        today = date_index[i]
+        prev_date = date_index[i-1]
         
-    return pd.Series(hist, index=dates, name="Risky_Basket")
-
-def run_crossover_strategy(df_full, risky_weights, safe_asset, fast_period, slow_period, ma_type, start_date, end_date):
-    
-    # 1. Build Basket (Full History)
-    risky_nav = get_basket_nav(df_full, risky_weights)
-    
-    # 2. Calculate MAs (Full History)
-    if ma_type == "EMA":
-        fast_ma = risky_nav.ewm(span=fast_period, adjust=False).mean()
-        slow_ma = risky_nav.ewm(span=slow_period, adjust=False).mean()
-    else:
-        fast_ma = risky_nav.rolling(window=fast_period, min_periods=1).mean()
-        slow_ma = risky_nav.rolling(window=slow_period, min_periods=1).mean()
-    
-    # 3. Logic: Invested if Fast > Slow
-    # Shift(1) to avoid lookahead
-    raw_signal = (fast_ma > slow_ma)
-    trade_signal = raw_signal.shift(1).fillna(True)
-    
-    # 4. Slice Data
-    mask = (df_full.index.date >= start_date) & (df_full.index.date <= end_date)
-    df_slice = df_full.loc[mask]
-    
-    if df_slice.empty: return None, None, None, None, None, None
-
-    risky_nav = risky_nav.loc[mask]
-    trade_signal = trade_signal.loc[mask]
-    fast_ma = fast_ma.loc[mask]
-    slow_ma = slow_ma.loc[mask]
-    
-    # Rebase for Viz
-    rebase = 100 / risky_nav.iloc[0]
-    risky_viz = risky_nav * rebase
-    fast_viz = fast_ma * rebase
-    slow_viz = slow_ma * rebase
-    
-    # 5. Returns
-    risky_ret = risky_nav.pct_change().fillna(0)
-    safe_ret = df_slice[safe_asset].pct_change().fillna(0)
-    
-    final_ret = np.where(trade_signal, risky_ret, safe_ret)
-    strat_nav = (1 + final_ret).cumprod() * 100
-    strat_series = pd.Series(strat_nav, index=df_slice.index, name="Strategy")
-    
-    return strat_series, risky_viz, fast_viz, slow_viz, trade_signal, df_slice
-
-def analyze_trades(signal_series, strategy_nav):
-    # Convert to int
-    sig_int = signal_series.astype(int)
-    trades = sig_int.diff().fillna(0)
-    
-    entries = trades[trades == 1].index
-    exits = trades[trades == -1].index
-    
-    # Handle Start/End
-    if sig_int.iloc[0] == 1: entries = entries.insert(0, sig_int.index[0])
-    if sig_int.iloc[-1] == 1: exits = exits.append(pd.Index([sig_int.index[-1]]))
+        # 1. Apply Returns to each component individually (Drift)
+        # component_new = component_old * (1 + daily_return)
+        component_values = component_values * (1 + ret_values[i])
         
-    n = min(len(entries), len(exits))
-    entries, exits = entries[:n], exits[:n]
-    
-    log = []
-    total_days_held = 0
-    
-    for en, ex in zip(entries, exits):
-        try:
-            val_in = strategy_nav.loc[en]
-            val_out = strategy_nav.loc[ex]
-            ret = (val_out/val_in) - 1
-            days = (ex - en).days
-            total_days_held += days
+        total_val = np.sum(component_values)
+        
+        # 2. Check Rebalance Trigger
+        rebalance = False
+        if is_daily:
+            rebalance = True
+        elif is_monthly and today.month != prev_date.month:
+            rebalance = True
+        elif is_yearly and today.year != prev_date.year:
+            rebalance = True
             
-            log.append({
-                "Entry": en.date(),
-                "Exit": ex.date(),
-                "Days Held": days,
-                "Return": ret,
-                "Status": "Win" if ret > 0 else "Loss"
-            })
-        except: pass
+        # 3. Rebalance if needed
+        if rebalance and not is_never:
+            # Reset components to Total * Target_Weight
+            component_values = total_val * target_weights
+            
+        history.append(total_val)
+        dates.append(today)
         
-    avg_hold = total_days_held / n if n > 0 else 0
-    return pd.DataFrame(log), avg_hold
+    return pd.Series(history, index=dates, name="Strategy")
 
-# --- 3. UI ---
-st.sidebar.header("1. Input")
-f = st.sidebar.file_uploader("Upload", type=['xlsx','csv'])
-df_raw = load_data(f)
-if df_raw is None: st.info(f"Load Data... {DEFAULT_PATH}"); st.stop()
-cols = df_raw.columns.tolist()
+# --- SIDEBAR & SETUP ---
+st.sidebar.header("Configuration")
 
-st.sidebar.header("2. Asset Config")
-st.sidebar.markdown("**Risky Basket**")
-assets = st.sidebar.multiselect("Select Assets", cols, default=cols[:2] if len(cols)>1 else cols)
-weights = {}
-if assets:
-    def_w = 100/len(assets)
-    for a in assets:
-        weights[a] = st.sidebar.number_input(f"{a}%",0,100,int(def_w))/100.0
-else: st.stop()
+# 1. Load Data
+uploaded_file = st.sidebar.file_uploader("Upload Data", type=['xlsx', 'csv'])
+df_raw = load_data(uploaded_file)
 
-st.sidebar.markdown("**Safe Asset**")
-d_guess = [c for c in cols if "Money" in c or "Liquid" in c or "Debt" in c]
-safe_asset = st.sidebar.selectbox("Select Fund", cols, index=cols.index(d_guess[0]) if d_guess else 0)
+if df_raw is None:
+    st.info("Please upload data or check the default path.")
+    st.stop()
 
-st.sidebar.markdown("**Benchmark**")
-n_guess = [c for c in cols if "Nifty" in c and "50" in c]
-bench_col = st.sidebar.selectbox("Comparison", cols, index=cols.index(n_guess[0]) if n_guess else 0)
+all_cols = df_raw.columns.tolist()
 
-# --- SETTINGS ---
-st.sidebar.header("3. Crossover Settings")
-ma_type = st.sidebar.selectbox("MA Type", ["EMA", "SMA"], index=0)
-c1, c2 = st.sidebar.columns(2)
-fast_p = c1.number_input("Fast MA (Green Line)", value=50, step=10, help="Entry Signal")
-slow_p = c2.number_input("Slow MA (Red Line)", value=200, step=10, help="Trend Baseline")
+# 2. Portfolio Construction
+st.sidebar.subheader("Portfolio Composition")
 
-st.sidebar.caption("Strategy: Buy when FAST > SLOW. Sell when FAST < SLOW.")
+# Multi-select for assets
+selected_assets = st.sidebar.multiselect("Select All Assets (Equity & Debt)", all_cols, default=all_cols[:2] if len(all_cols)>=2 else all_cols)
 
-st.sidebar.header("4. Dates")
-valid = df_raw.index
-s_d = st.sidebar.date_input("Start", max(valid.min().date(), date(2014,1,1)))
-e_d = st.sidebar.date_input("End", valid.max().date())
+if not selected_assets:
+    st.error("Please select at least one asset.")
+    st.stop()
 
-# --- RUN ---
-mask = (df_raw.index.date >= s_d) & (df_raw.index.date <= e_d)
-df_slice = df_raw.loc[mask]
+# Dynamic Weight Inputs
+st.sidebar.write(" **Assign Weights (%)**")
+weights_input = {}
+weight_cols = st.sidebar.columns(1) # Stack them vertically for clarity
 
-strat, r_viz, fast_viz, slow_viz, sigs, df_used = run_crossover_strategy(
-    df_raw, weights, safe_asset, int(fast_p), int(slow_p), ma_type, s_d, e_d
-)
+total_weight = 0
+for asset in selected_assets:
+    # default to equal weight
+    def_w = 100.0 / len(selected_assets)
+    w = st.sidebar.number_input(f"{asset} %", min_value=0.0, max_value=100.0, value=float(int(def_w)), step=5.0)
+    weights_input[asset] = w / 100.0
+    total_weight += w
 
-if strat is None: st.error("No Data"); st.stop()
+# Validation
+if abs(total_weight - 100.0) > 0.01:
+    st.sidebar.error(f"Total Weight: {total_weight:.2f}%. Must be 100%.")
+else:
+    st.sidebar.success(f"Total Weight: 100%")
 
-# Stats
-t_log, avg_hold_days = analyze_trades(sigs, strat)
-bench = df_slice[bench_col]
-bench = (bench/bench.iloc[0])*100
-combined = pd.DataFrame({'Strategy': strat, 'Nifty 50': bench})
+# 3. Benchmark & Settings
+st.sidebar.subheader("Settings")
+# Try to find Nifty 50 as default
+nifty_candidates = [c for c in all_cols if "Nifty" in c and "50" in c]
+default_bench = nifty_candidates[0] if nifty_candidates else all_cols[0]
 
-# --- METRICS ---
-def metrics(s):
-    if s.empty: return 0,0,0
-    y = (s.index[-1]-s.index[0]).days/365.25
-    cagr = (s.iloc[-1]/s.iloc[0])**(1/y)-1 if y>0 else 0
-    vol = s.pct_change().dropna().std()*np.sqrt(252)
-    dd = ((s/s.cummax())-1).min()
-    return cagr, vol, dd
+benchmark_col = st.sidebar.selectbox("Benchmark", all_cols, index=all_cols.index(default_bench))
 
-sc, sv, sd = metrics(combined['Strategy'])
-bc, bv, bd = metrics(combined['Nifty 50'])
+rebalance_freq = st.sidebar.selectbox("Rebalancing", ["Daily", "Monthly", "Yearly", "Never (Buy & Hold)"], index=1)
 
-st.title(f"{fast_p}/{slow_p} {ma_type} Crossover Strategy")
+# 4. Dates
+valid_data = df_raw[selected_assets + [benchmark_col]].dropna()
+if valid_data.empty:
+    st.error("Selected assets have no overlapping data range.")
+    st.stop()
+
+min_d, max_d = valid_data.index.min().date(), valid_data.index.max().date()
+default_start = max(min_d, date(2014, 1, 1))
+
+start_date = st.sidebar.date_input("Start Date", value=default_start, min_value=min_d, max_value=max_d)
+end_date = st.sidebar.date_input("End Date", value=max_d, min_value=min_d, max_value=max_d)
+
+if start_date >= end_date:
+    st.error("Start Date must be before End Date")
+    st.stop()
+
+# --- MAIN EXECUTION ---
+
+# Filter Data
+mask = (df_raw.index.date >= start_date) & (df_raw.index.date <= end_date)
+df_slice = df_raw.loc[mask].copy()
+
+if abs(total_weight - 100.0) > 0.01:
+    st.warning("Please correct weights in the sidebar to equal 100% to view results.")
+    st.stop()
+
+# Run Backtest
+strat_series = run_portfolio_backtest(df_slice, weights_input, rebalance_freq)
+
+if strat_series is None:
+    st.error("Not enough data to calculate returns.")
+    st.stop()
+
+# Normalize Benchmark
+bench_series = df_slice[benchmark_col].loc[strat_series.index]
+bench_series = (bench_series / bench_series.iloc[0]) * 100
+
+# Combined DF
+res_df = pd.DataFrame({'Strategy': strat_series, 'Benchmark': bench_series})
+
+# --- METRICS & VISUALS ---
+
+st.title("Multi-Asset Strategy Dashboard")
+
+# Top Metrics
+years = (res_df.index[-1] - res_df.index[0]).days / 365.25
+
+def calc_metrics(series):
+    cagr = (series.iloc[-1] / series.iloc[0]) ** (1/years) - 1
+    ret = series.pct_change().dropna()
+    vol = ret.std() * np.sqrt(252)
+    return cagr, vol
+
+s_cagr, s_vol = calc_metrics(res_df['Strategy'])
+b_cagr, b_vol = calc_metrics(res_df['Benchmark'])
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("CAGR", f"{sc:.2%}", f"{(sc-bc)*100:.2f} pts")
-col2.metric("Max Drawdown", f"{sd:.2%}", f"{(sd-bd)*100:.2f} pts", delta_color="inverse")
-col3.metric("Trades", f"{len(t_log)}", f"Avg Hold: {int(avg_hold_days)} Days")
-col4.metric("Win Rate", f"{(len(t_log[t_log['Return']>0])/len(t_log) if len(t_log)>0 else 0):.0%}")
+col1.metric("Strategy CAGR", f"{s_cagr:.2%}")
+col2.metric("Benchmark CAGR", f"{b_cagr:.2%}", delta=f"{(s_cagr-b_cagr)*100:.2f} pts")
+col3.metric("Strategy Volatility", f"{s_vol:.2%}")
+col4.metric("Benchmark Volatility", f"{b_vol:.2%}", delta=f"{(s_vol-b_vol)*100:.2f} pts", delta_color="inverse")
 
-# --- CHARTS ---
-st.subheader("Performance vs Benchmark")
-st.plotly_chart(px.line(combined, title="Growth of 100"), use_container_width=True)
+# Main Chart
+st.subheader("Growth of 100")
+st.plotly_chart(px.line(res_df, title="Portfolio Performance"), use_container_width=True)
 
-with st.expander("🔍 Crossover Visualization (The Golden Cross)", expanded=True):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=r_viz.index, y=r_viz, name="Price", line=dict(color='gray', width=1)))
-    fig.add_trace(go.Scatter(x=fast_viz.index, y=fast_viz, name=f"Fast MA ({fast_p})", line=dict(color='green', width=2)))
-    fig.add_trace(go.Scatter(x=slow_viz.index, y=slow_viz, name=f"Slow MA ({slow_p})", line=dict(color='red', width=2)))
+# Tabs
+tab1, tab2, tab3 = st.tabs(["Yearly Returns", "Monthly Heatmap", "Drawdowns"])
+
+with tab1:
+    st.subheader("Calendar Year Returns")
+    y_df = res_df.resample('YE').last()
     
-    # Shade zones
-    y_min = r_viz.min()
-    y_max = r_viz.max()
+    # Handle first year partial return
+    # Add initial 100 row at start_date - 1 day for accurate first year pct_change
+    start_row_date = res_df.index[0] - pd.Timedelta(days=1)
+    start_row = pd.DataFrame([[100, 100]], columns=['Strategy', 'Benchmark'], index=[start_row_date])
     
-    # We can visualize 'Invested' zones by coloring background or using marker lines
-    # Simple method: Dots on crossovers
-    crossovers = sigs.astype(int).diff()
-    buys = crossovers[crossovers == 1].index
-    sells = crossovers[crossovers == -1].index
+    # Concatenate strictly for calculation
+    calc_df = pd.concat([start_row, y_df]).sort_index()
+    y_ret = calc_df.pct_change().dropna() # This drops the dummy start row, leaves real years
     
-    # Filter for view
-    buys = [b for b in buys if b >= s_d]
-    sells = [s for s in sells if s >= s_d]
+    y_ret['Alpha'] = y_ret['Strategy'] - y_ret['Benchmark']
+    y_ret.index = y_ret.index.year
+    
+    st.dataframe(y_ret.style.format("{:.2%}").background_gradient(cmap='RdYlGn', subset=['Strategy', 'Alpha']), use_container_width=True)
 
-    # Add markers
-    # For accurate Y value, grab Fast MA value at that date
-    if buys:
-        buy_y = [fast_viz.loc[b] for b in buys]
-        fig.add_trace(go.Scatter(x=buys, y=buy_y, mode='markers', name="Golden Cross (Buy)", marker=dict(color='green', size=12, symbol='triangle-up')))
-    if sells:
-        sell_y = [fast_viz.loc[s] for s in sells]
-        fig.add_trace(go.Scatter(x=sells, y=sell_y, mode='markers', name="Death Cross (Sell)", marker=dict(color='red', size=12, symbol='triangle-down')))
+with tab2:
+    st.subheader("Strategy Monthly Returns")
+    m_ret = res_df['Strategy'].resample('ME').apply(lambda x: (x.iloc[-1]/x.iloc[0]) - 1 if len(x) > 0 else 0)
+    
+    heat_df = pd.DataFrame({'Year': m_ret.index.year, 'Month': m_ret.index.strftime('%b'), 'Ret': m_ret.values})
+    piv = heat_df.pivot(index='Year', columns='Month', values='Ret')
+    piv = piv.reindex(columns=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'])
+    
+    # Add YTD
+    ytd = res_df['Strategy'].resample('YE').apply(lambda x: (x.iloc[-1]/x.iloc[0]) - 1)
+    piv['YTD'] = ytd.values
+    
+    st.dataframe(piv.style.format("{:.2%}", na_rep="-").background_gradient(cmap='RdYlGn', axis=None), use_container_width=True)
 
-    st.plotly_chart(fig, use_container_width=True)
-
-# --- TABLES ---
-st.subheader("Yearly Returns")
-y_df = combined.resample('YE').last()
-s_row = pd.DataFrame([100,100], index=['Strategy','Nifty 50'], columns=[combined.index[0]-pd.Timedelta(days=1)]).T
-y_calc = pd.concat([s_row, y_df]).sort_index().pct_change().dropna()
-y_calc['Alpha'] = y_calc['Strategy'] - y_calc['Nifty 50']
-y_calc.index = y_calc.index.year
-st.dataframe(y_calc.style.format("{:.2%}").background_gradient(cmap='RdYlGn', subset=['Strategy','Alpha']), use_container_width=True)
-
-st.subheader("Trade Log (Proof of Holding Period)")
-if not t_log.empty:
-    st.dataframe(t_log.style.format({"Return": "{:.2%}"}).background_gradient(cmap='RdYlGn', subset=['Return']), use_container_width=True)
+with tab3:
+    st.subheader("Drawdowns")
+    dd = (res_df / res_df.cummax()) - 1
+    st.plotly_chart(px.area(dd, title="Underwater Plot"), use_container_width=True)
+    st.write(f"**Max Drawdown (Strategy):** {dd['Strategy'].min():.2%}")
