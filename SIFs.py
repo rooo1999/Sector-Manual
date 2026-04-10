@@ -1,149 +1,166 @@
-import streamlit as st
-import pandas as pd
 import requests
+from bs4 import BeautifulSoup
+import pandas as pd
 from datetime import datetime, timedelta
-import plotly.express as px
-
-st.set_page_config(page_title="ISIN Performance Tracker", layout="wide")
 
 # ==========================================
-# 1. MAP NAMES TO ISINs HERE
+# 1. YOUR SIF MAPPING
 # ==========================================
-# Replace the placeholder 'INF...' strings with the actual ISINs you possess.
 sif_mapping = {
-    "SBI Magnum Hybrid L/S": "INF200K30015",      # <-- Replace with actual ISIN
+    "ICICI": "INF109K30034",
+    # Add your actual ISINs here
+    "Test Person 2": "INF846K01NG6", 
 }
 
 # ==========================================
-# 2. STEP 1: TRANSLATE ISIN TO SCHEME CODE
+# 2. SMART SIF SCRAPER (No html5lib needed)
 # ==========================================
-@st.cache_data(ttl=86400) # Cache this for 24 hours so it runs fast
-def get_isin_to_scheme_mapping():
-    """Fetches the daily AMFI text file and maps every ISIN to its Scheme Code."""
-    url = "https://www.amfiindia.com/spages/NAVAll.txt"
-    try:
-        response = requests.get(url, timeout=10)
-        lines = response.text.split('\n')
-        
-        mapping = {}
-        for line in lines:
-            parts = line.split(';')
-            # Check if row is actual data (starts with numeric scheme code)
-            if len(parts) >= 6 and parts[0].isdigit():
-                scheme_code = parts[0].strip()
-                isin_growth = parts[1].strip()
-                isin_reinv = parts[2].strip()
-                
-                # Map both possible ISIN columns to the scheme code
-                if isin_growth and isin_growth != '-':
-                    mapping[isin_growth] = scheme_code
-                if isin_reinv and isin_reinv != '-':
-                    mapping[isin_reinv] = scheme_code
-                    
-        return mapping
-    except Exception as e:
-        st.error(f"Failed to fetch AMFI Master List: {e}")
-        return {}
+def fetch_sif_data(isin):
+    url = "https://www.amfiindia.com/sif/latest-nav/nav-history"
+    session = requests.Session()
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
 
-# ==========================================
-# 3. STEP 2: FETCH HISTORICAL DATA
-# ==========================================
-@st.cache_data(ttl=3600) 
-def fetch_historical_nav(scheme_code):
-    """Fetches trailing 1.5 years of NAV data for YoY calculation."""
-    end_date = datetime.today()
-    start_date = end_date - timedelta(days=400) 
-    
-    start_str = start_date.strftime('%d-%b-%Y')
-    end_str = end_date.strftime('%d-%b-%Y')
-    
-    url = f"http://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?tp=1&frmdt={start_str}&todt={end_str}"
-    
     try:
-        df = pd.read_csv(url, sep=';', on_bad_lines='skip')
-        df.columns = df.columns.str.strip()
-        df = df[df['Scheme Code'] == int(scheme_code)]
+        # Step 1: GET request to load the form
+        response = session.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        if df.empty: return None, None
+        # Calculate Dates
+        end_date = datetime.today()
+        start_date = end_date - timedelta(days=400)
+        start_str = start_date.strftime('%d-%b-%Y')
+        end_str = end_date.strftime('%d-%b-%Y')
+        
+        # Step 2: Dynamically build the POST payload
+        payload = {}
+        for inp in soup.find_all('input'):
+            name = inp.get('name')
+            if not name: 
+                continue
             
-        scheme_name = df['Scheme Name'].iloc[0]
-        df['Date'] = pd.to_datetime(df['Date'], format='%d-%b-%Y')
-        df['Net Asset Value'] = pd.to_numeric(df['Net Asset Value'], errors='coerce')
+            value = inp.get('value', '')
+            name_lower = name.lower()
+            
+            if 'isin' in name_lower:
+                payload[name] = isin
+            elif 'fromdate' in name_lower or ('from' in name_lower and 'date' in name_lower):
+                payload[name] = start_str
+            elif 'todate' in name_lower or ('to' in name_lower and 'date' in name_lower):
+                payload[name] = end_str
+            else:
+                payload[name] = value
+                
+        # Step 3: POST the form submission
+        post_response = session.post(url, data=payload, headers=headers, timeout=15)
+        post_response.raise_for_status()
         
-        df = df.sort_values('Date').dropna(subset=['Net Asset Value']).reset_index(drop=True)
-        return df, scheme_name
+        # Step 4: MANUALLY EXTRACT TABLE USING BEAUTIFULSOUP (Bypassing pd.read_html)
+        post_soup = BeautifulSoup(post_response.text, 'html.parser')
+        
+        # Find all tables on the resulting page
+        tables = post_soup.find_all('table')
+        target_table = None
+        
+        # Locate the table that actually contains the NAV data
+        for table in tables:
+            text = table.get_text().lower()
+            if 'date' in text and 'nav' in text:
+                target_table = table
+                break
+                
+        if not target_table:
+            return None, "No data table found on the AMFI response page."
+
+        # Parse the table headers
+        raw_rows = target_table.find_all('tr')
+        if not raw_rows:
+            return None, "Table found, but it has no rows."
+
+        # Extract headers from the first row (sometimes they use <th>, sometimes <td>)
+        headers = [h.get_text(strip=True).lower() for h in raw_rows[0].find_all(['th', 'td'])]
+        
+        # Parse the table data
+        data = []
+        for row in raw_rows[1:]: # Skip header row
+            cols = row.find_all('td')
+            if len(cols) == len(headers):
+                data.append([c.get_text(strip=True) for c in cols])
+                
+        # Create DataFrame
+        df = pd.DataFrame(data, columns=headers)
+        
+        # Identify the correct columns
+        date_col = next((col for col in df.columns if 'date' in col), None)
+        nav_col = next((col for col in df.columns if 'nav' in col), None)
+        
+        if not date_col or not nav_col:
+            return None, "Could not identify Date or NAV columns."
+            
+        # Clean and convert the data
+        df = df.rename(columns={date_col: 'Date', nav_col: 'NAV'})
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df['NAV'] = pd.to_numeric(df['NAV'], errors='coerce')
+        
+        df = df.dropna(subset=['Date', 'NAV']).sort_values('Date').reset_index(drop=True)
+        
+        if df.empty:
+            return None, "Table parsed, but no valid numeric data was found."
+            
+        return df, "Success"
         
     except Exception as e:
-        st.error(f"Error fetching historical data: {e}")
-        return None, None
+        return None, f"Error: {str(e)}"
 
 # ==========================================
-# 4. PERFORMANCE CALCULATIONS
+# 3. PERFORMANCE CALCULATOR
 # ==========================================
 def calculate_metrics(df):
     latest_date = df['Date'].iloc[-1]
-    latest_nav = df['Net Asset Value'].iloc[-1]
+    latest_nav = df['NAV'].iloc[-1]
     
-    def get_nav_days_ago(days):
-        target_date = latest_date - timedelta(days=days)
-        closest = df.iloc[(df['Date'] - target_date).abs().argsort()[:1]]
-        if not closest.empty:
-            return closest['Net Asset Value'].values[0]
-        return None
+    def get_nav_days_ago(target_days):
+        target_date = latest_date - timedelta(days=target_days)
+        closest_idx = (df['Date'] - target_date).abs().idxmin()
+        return df.loc[closest_idx, 'NAV']
 
-    nav_30d = get_nav_days_ago(30)
-    nav_90d = get_nav_days_ago(90)
-    nav_365d = get_nav_days_ago(365)
-    
-    mom = ((latest_nav / nav_30d) - 1) * 100 if nav_30d else None
-    qoq = ((latest_nav / nav_90d) - 1) * 100 if nav_90d else None
-    yoy = ((latest_nav / nav_365d) - 1) * 100 if nav_365d else None
-    
-    return latest_nav, latest_date, mom, qoq, yoy
-
-# ==========================================
-# 5. STREAMLIT DASHBOARD UI
-# ==========================================
-st.title("📊 ISIN-Based SIF Performance Tracker")
-st.markdown("Translates ISINs to AMFI Scheme Codes to track trailing MoM, QoQ, and YoY NAV returns.")
-
-# Load the master dictionary in the background
-isin_to_scheme_map = get_isin_to_scheme_mapping()
-
-selected_name = st.selectbox("Select Manager/SIF Profile:", list(sif_mapping.keys()))
-target_isin = sif_mapping[selected_name]
-
-st.caption(f"Target ISIN: `{target_isin}`")
-
-if st.button("Fetch Performance"):
-    if target_isin not in isin_to_scheme_map:
-        st.error(f"ISIN {target_isin} was not found in the active AMFI database.")
-    else:
-        scheme_code = isin_to_scheme_map[target_isin]
+    try:
+        nav_30d = get_nav_days_ago(30)
+        nav_90d = get_nav_days_ago(90)
+        nav_365d = get_nav_days_ago(365)
         
-        with st.spinner(f"ISIN matched to Scheme Code {scheme_code}. Fetching historical data..."):
-            df, scheme_name = fetch_historical_nav(scheme_code)
+        mom = ((latest_nav / nav_30d) - 1) * 100
+        qoq = ((latest_nav / nav_90d) - 1) * 100
+        yoy = ((latest_nav / nav_365d) - 1) * 100
+        
+        return latest_nav, latest_date, mom, qoq, yoy
+    except Exception:
+        return latest_nav, latest_date, None, None, None
+
+# ==========================================
+# 4. MAIN EXECUTION
+# ==========================================
+if __name__ == "__main__":
+    print("-" * 80)
+    print(f"{'MANAGER/SIF':<20} | {'ISIN':<15} | {'LATEST NAV':<12} | {'MoM %':<8} | {'QoQ %':<8} | {'YoY %':<8}")
+    print("-" * 80)
+
+    for name, isin in sif_mapping.items():
+        df, status = fetch_sif_data(isin)
+        
+        if df is not None:
+            latest_nav, latest_date, mom, qoq, yoy = calculate_metrics(df)
             
-            if df is not None and not df.empty:
-                latest_nav, latest_date, mom, qoq, yoy = calculate_metrics(df)
-                
-                st.success(f"**Fund Name:** {scheme_name}")
-                
-                # Metrics Row
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Latest NAV", f"₹{latest_nav:.4f}", f"As of {latest_date.strftime('%d %b %Y')}")
-                
-                def fmt(val): return f"{val:.2f}%" if val is not None else "N/A"
-                col2.metric("MoM (30d)", fmt(mom), fmt(mom))
-                col3.metric("QoQ (90d)", fmt(qoq), fmt(qoq))
-                col4.metric("YoY (365d)", fmt(yoy), fmt(yoy))
-                
-                # Chart
-                st.markdown("---")
-                st.subheader("1-Year NAV Trend")
-                fig = px.line(df, x='Date', y='Net Asset Value', template="plotly_white")
-                fig.update_traces(line_color='#1E88E5', line_width=2)
-                st.plotly_chart(fig, use_container_width=True)
-                
-            else:
-                st.error("Historical data could not be fetched for this fund.")
+            f_nav = f"₹{latest_nav:.4f}"
+            f_mom = f"{mom:.2f}%" if mom is not None else "N/A"
+            f_qoq = f"{qoq:.2f}%" if qoq is not None else "N/A"
+            f_yoy = f"{yoy:.2f}%" if yoy is not None else "N/A"
+            
+            print(f"{name:<20} | {isin:<15} | {f_nav:<12} | {f_mom:<8} | {f_qoq:<8} | {f_yoy:<8}")
+        else:
+            print(f"{name:<20} | {isin:<15} | {'FAILED':<12} | {'-':<8} | {'-':<8} | {'-':<8}  -> {status}")
+
+    print("-" * 80)

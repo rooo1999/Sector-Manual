@@ -162,7 +162,7 @@ def style_table(styler, format_str, na_rep, cmap, weight_col=None):
     
     styler.format(format_str, subset=cols, na_rep=na_rep)
     styler.background_gradient(cmap=cmap, subset=cols, axis=0) 
-    styler.applymap_index(lambda v: 'text-align: left;', axis='index')
+    styler.set_properties(**{'text-align': 'left'}, subset=pd.IndexSlice[:, :])
     return styler
 
 # --- Main App ---
