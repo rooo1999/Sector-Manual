@@ -50,32 +50,34 @@ def read_portfolios_from_google_sheet(sheet_id):
                 if np.isclose(df[col].sum(), 100.0, atol=0.1):
                     df[col] = df[col] / 100.0
             
-            def parse_mixed_date(col):
-                """Robust date parser handling multiple real-world formats."""
+        def parse_mixed_date(col):
+            try:
+                if isinstance(col, pd.Timestamp):
+                    return col
+
+                # Excel serial number
+                if isinstance(col, (int, float)) and col > 10000:
+                    return pd.to_datetime("1899-12-30") + pd.to_timedelta(col, unit='D')
+
+                col_str = str(col).strip()
+
+                # 🔴 FORCE DD/MM/YYYY first
                 try:
-                    # Case 1: Already datetime
-                    if isinstance(col, pd.Timestamp):
-                        return col
-                
-                    # Case 2: Excel serial number (very common issue)
-                    if isinstance(col, (int, float)) and col > 10000:
-                        return pd.to_datetime("1899-12-30") + pd.to_timedelta(col, unit='D')
+                    return pd.to_datetime(col_str, dayfirst=True, errors='raise')
+                except:
+                    pass
 
-                    col_str = str(col).strip()
-
-                    # Try multiple parsing strategies
-                    for fmt in [None, "%d-%m-%Y", "%Y-%m-%d", "%b-%Y", "%b %Y", "%b-%y", "%b %y"]:
+                # Try common formats
+                    for fmt in ["%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%b-%Y", "%b %Y"]:
                         try:
-                            return pd.to_datetime(col_str, format=fmt, errors='raise', dayfirst=True)
+                            return pd.to_datetime(col_str, format=fmt, errors='raise')
                         except:
                             continue
 
-                    # Final fallback (let pandas guess)
-                    return pd.to_datetime(col_str, errors='coerce', dayfirst=True)
+                return pd.NaT
 
-                except:
-                    return pd.NaT
-
+            except:
+                return pd.NaT
 
             # Apply parsing
             parsed_columns = {col: parse_mixed_date(col) for col in df.columns}
