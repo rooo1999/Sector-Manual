@@ -49,7 +49,13 @@ def read_portfolios_from_google_sheet(sheet_id):
             for col in numeric_cols:
                 if np.isclose(df[col].sum(), 100.0, atol=0.1):
                     df[col] = df[col] / 100.0
-            parsed_columns = {col: pd.to_datetime(col, dayfirst=False, errors='coerce') for col in df.columns}
+            parsed_columns = {}
+            for col in df.columns:
+                try:
+                    parsed_columns[col] = pd.to_datetime(col, errors='coerce')
+                except:
+                    parsed_columns[col] = pd.NaT
+
             df = df.rename(columns=parsed_columns)
             df = df[[c for c in df.columns if isinstance(c, pd.Timestamp)]].sort_index(axis=1)
             if not df.empty:
