@@ -48,33 +48,30 @@ def read_portfolios_from_google_sheet(sheet_id):
 
             col_str = str(col).strip()
 
-            # DD/MM/YYYY
+            # Try strict DD/MM/YYYY
             try:
                 return pd.to_datetime(col_str, format="%d/%m/%Y", errors='raise')
             except:
                 pass
 
-            # DD-MM-YYYY
+            # Try DD-MM-YYYY
             try:
                 return pd.to_datetime(col_str, format="%d-%m-%Y", errors='raise')
             except:
                 pass
 
-            # Month formats
+            # Try month formats
             try:
                 return pd.to_datetime(col_str, format="%b-%Y", errors='raise')
             except:
                 pass
 
-            # ISO format (fix warning)
-            if "-" in col_str and ":" in col_str:
-                return pd.to_datetime(col_str, errors='coerce')
-
+            # Final fallback
             return pd.to_datetime(col_str, errors='coerce', dayfirst=True)
 
         except:
             return pd.NaT
-    
+
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
 
     try:
@@ -136,67 +133,35 @@ def get_names_from_codes(scheme_codes_list):
             names[str(code)] = f"Unknown: {code}"
     return names
 
-@st.cache_data(ttl=86400, show_spinner="Fetching & caching NAV data...")
+@st.cache_data(ttl="1h", show_spinner="Fetching all historical NAV data...")
 def _fetch_full_nav_history(scheme_codes_tuple):
     """
-    Optimized NAV fetcher:
-    - Parallel fetching
-    - Retry logic
-    - Streamlit caching (24h)
+    Fetches the complete NAV history for a tuple of scheme codes.
+    Returns a dictionary mapping scheme codes to their historical NAV DataFrame.
     """
-
-    import time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     all_nav_history = {}
-    failed_codes = []
+    progress_bar = st.progress(0, text=f"Fetching historical NAVs...")
 
-    progress_bar = st.progress(0, text="Fetching NAVs...")
-
-    def fetch_single(code):
-        for attempt in range(3):
-            try:
-                url = f"https://api.mfapi.in/mf/{code}"
-                response = requests.get(url, timeout=10)
-
-                if response.status_code == 200:
-                    nav_data = response.json().get("data", [])
-                    if nav_data:
-                        df = pd.DataFrame(nav_data)
-                        df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
-                        df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
-                        df = df.dropna().set_index('date').sort_index()
-                        return code, df['nav']
-
-                time.sleep(1 + attempt)
-
-            except:
-                time.sleep(1 + attempt)
-
-        return code, None
-
-    max_workers = 5
-    total = len(scheme_codes_tuple)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_single, code): code for code in scheme_codes_tuple}
-
-        for i, future in enumerate(as_completed(futures)):
-            code, result = future.result()
-
-            if result is not None:
-                all_nav_history[code] = result
+    for i, code in enumerate(scheme_codes_tuple):
+        try:
+            url = f"https://api.mfapi.in/mf/{code}"
+            response = requests.get(url)
+            if response.status_code == 200:
+                nav_data = response.json().get("data", [])
+                if nav_data:
+                    df = pd.DataFrame(nav_data)
+                    df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
+                    df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
+                    df = df.dropna().set_index('date').sort_index()
+                    all_nav_history[code] = df['nav']
             else:
-                failed_codes.append(code)
-
-            progress_bar.progress((i + 1) / total, text=f"Fetching NAVs... ({i+1}/{total})")
-            time.sleep(0.1)
+                logging.warning(f"Failed to fetch full NAV history for scheme {code}: HTTP {response.status_code}")
+        except Exception as e:
+            logging.warning(f"Exception fetching full NAV history for scheme {code}: {e}")
+        finally:
+            progress_bar.progress((i + 1) / len(scheme_codes_tuple), text=f"Fetching NAVs... ({i+1}/{len(scheme_codes_tuple)})")
 
     progress_bar.empty()
-
-    if failed_codes:
-        st.warning(f"⚠️ Failed to fetch NAV for {len(failed_codes)} schemes")
-
     return all_nav_history
 
 def calculate_trailing_returns(series):
@@ -282,11 +247,6 @@ if all_portfolios_data_original:
         
         full_nav_history = _fetch_full_nav_history(all_scheme_codes)
         all_navs_df = pd.DataFrame(full_nav_history).ffill().bfill()
-        missing_benchmarks = [b for b in BENCHMARKS.values() if b not in all_navs_df.columns]
-
-if missing_benchmarks:
-    st.error("❌ Benchmark data missing. API unstable. Please rerun.")
-    st.stop()
 else:
     st.warning("No portfolio data was loaded from the Google Sheet. Please check the sheet's format and sharing settings.")
     st.stop()
