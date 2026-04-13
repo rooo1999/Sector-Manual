@@ -50,14 +50,46 @@ def read_portfolios_from_google_sheet(sheet_id):
                 if np.isclose(df[col].sum(), 100.0, atol=0.1):
                     df[col] = df[col] / 100.0
             
-            parsed_columns = {}
-            for col in df.columns:
-                col_str = str(col).strip()
-                parsed_date = pd.to_datetime(col_str, errors='coerce', dayfirst=True)
-                parsed_columns[col] = parsed_date
+            def parse_mixed_date(col):
+                """Robust date parser handling multiple real-world formats."""
+                try:
+                    # Case 1: Already datetime
+                    if isinstance(col, pd.Timestamp):
+                        return col
+                
+                    # Case 2: Excel serial number (very common issue)
+                    if isinstance(col, (int, float)) and col > 10000:
+                        return pd.to_datetime("1899-12-30") + pd.to_timedelta(col, unit='D')
 
+                    col_str = str(col).strip()
+
+                    # Try multiple parsing strategies
+                    for fmt in [None, "%d-%m-%Y", "%Y-%m-%d", "%b-%Y", "%b %Y", "%b-%y", "%b %y"]:
+                        try:
+                            return pd.to_datetime(col_str, format=fmt, errors='raise', dayfirst=True)
+                        except:
+                            continue
+
+                    # Final fallback (let pandas guess)
+                    return pd.to_datetime(col_str, errors='coerce', dayfirst=True)
+
+                except:
+                    return pd.NaT
+
+
+            # Apply parsing
+            parsed_columns = {col: parse_mixed_date(col) for col in df.columns}
             df = df.rename(columns=parsed_columns)
-            df = df[[c for c in df.columns if isinstance(c, pd.Timestamp)]].sort_index(axis=1)
+            
+            # Keep only valid parsed dates
+            valid_date_cols = [c for c in df.columns if pd.notna(c)]
+            df = df[valid_date_cols].sort_index(axis=1)
+
+            if df.empty:
+                st.warning(f"⚠️ Sheet '{sheet_name}' has no valid date columns after parsing.")
+            else:
+                st.info(f"✅ '{sheet_name}' parsed {len(df.columns)} date columns from {len(parsed_columns)} headers")
+
             if not df.empty:
                 cleaned_portfolios[sheet_name] = df
         return cleaned_portfolios
