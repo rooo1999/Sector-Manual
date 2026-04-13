@@ -37,68 +37,85 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 @st.cache_data(ttl="1h", show_spinner="Loading portfolio allocation data...")
 def read_portfolios_from_google_sheet(sheet_id):
     """Reads all sheets from a public Google Sheet and cleans them up."""
+    
+    def parse_mixed_date(col):
+        try:
+            if isinstance(col, pd.Timestamp):
+                return col
+
+            if isinstance(col, (int, float)) and col > 10000:
+                return pd.to_datetime("1899-12-30") + pd.to_timedelta(col, unit='D')
+
+            col_str = str(col).strip()
+
+            # Try strict DD/MM/YYYY
+            try:
+                return pd.to_datetime(col_str, format="%d/%m/%Y", errors='raise')
+            except:
+                pass
+
+            # Try DD-MM-YYYY
+            try:
+                return pd.to_datetime(col_str, format="%d-%m-%Y", errors='raise')
+            except:
+                pass
+
+            # Try month formats
+            try:
+                return pd.to_datetime(col_str, format="%b-%Y", errors='raise')
+            except:
+                pass
+
+            # Final fallback
+            return pd.to_datetime(col_str, errors='coerce', dayfirst=True)
+
+        except:
+            return pd.NaT
+
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+
     try:
         all_sheets = pd.read_excel(url, sheet_name=None, engine='openpyxl', dtype={0: str})
         cleaned_portfolios = {}
+
         for sheet_name, df in all_sheets.items():
             df = df.dropna(how='all').dropna(how='all', axis=1)
-            if df.empty or df.shape[1] < 2: continue
+            if df.empty or df.shape[1] < 2:
+                continue
+
             df = df.rename(columns={df.columns[0]: 'Scheme Code'}).set_index('Scheme Code')
+
+            # Normalize weights
             numeric_cols = df.select_dtypes(include=np.number).columns
             for col in numeric_cols:
                 if np.isclose(df[col].sum(), 100.0, atol=0.1):
                     df[col] = df[col] / 100.0
-            
-        def parse_mixed_date(col):
-            try:
-                if isinstance(col, pd.Timestamp):
-                    return col
 
-                # Excel serial number
-                if isinstance(col, (int, float)) and col > 10000:
-                    return pd.to_datetime("1899-12-30") + pd.to_timedelta(col, unit='D')
-
-                col_str = str(col).strip()
-
-                # 🔴 FORCE DD/MM/YYYY first
-                try:
-                    return pd.to_datetime(col_str, dayfirst=True, errors='raise')
-                except:
-                    pass
-
-                # Try common formats
-                    for fmt in ["%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%b-%Y", "%b %Y"]:
-                        try:
-                            return pd.to_datetime(col_str, format=fmt, errors='raise')
-                        except:
-                            continue
-
-                return pd.NaT
-
-            except:
-                return pd.NaT
-
-            # Apply parsing
+            # 🔥 DATE PARSING (inside loop)
             parsed_columns = {col: parse_mixed_date(col) for col in df.columns}
             df = df.rename(columns=parsed_columns)
-            
-            # Keep only valid parsed dates
+
+            # Keep valid date columns
             valid_date_cols = [c for c in df.columns if pd.notna(c)]
+
+            if len(valid_date_cols) == 0:
+                st.warning(f"⚠️ Sheet '{sheet_name}' has NO valid date columns.")
+                st.write("Original columns:", list(df.columns))
+                continue
+
             df = df[valid_date_cols].sort_index(axis=1)
 
-            if df.empty:
-                st.warning(f"⚠️ Sheet '{sheet_name}' has no valid date columns after parsing.")
-            else:
-                st.info(f"✅ '{sheet_name}' parsed {len(df.columns)} date columns from {len(parsed_columns)} headers")
+            # Optional debug
+            st.info(f"✅ '{sheet_name}' parsed {len(df.columns)} date columns")
 
-            if not df.empty:
-                cleaned_portfolios[sheet_name] = df
+            cleaned_portfolios[sheet_name] = df
+
         return cleaned_portfolios
-    except Exception as e:
-        st.error(f"Error reading from Google Sheet. Please ensure the Sheet ID is correct and the sheet is public ('Anyone with the link'). Error: {e}")
-        return {}
 
+    except Exception as e:
+        st.error(f"Error reading from Google Sheet. Ensure it is public. Error: {e}")
+        return {}
+    
 @st.cache_data(ttl="6h")
 def get_names_from_codes(scheme_codes_list):
     """Fetches mutual fund names from a list of scheme codes using an API."""
