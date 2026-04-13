@@ -229,7 +229,7 @@ if run_button or not st.session_state.analysis_run:
     if not all_portfolios_data_original or all_navs_df is None:
         st.error("Data could not be loaded. Please refresh the page.")
         st.stop()
-    if start_date > end_date:
+    if pd.to_datetime(start_date) > pd.to_datetime(end_date):
         st.error("Error: End date must be on or after start date.")
         st.stop()
     
