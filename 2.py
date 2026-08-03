@@ -40,8 +40,8 @@ def read_portfolios_from_google_sheet(sheet_id):
     
     def parse_mixed_date(col):
         try:
-            if isinstance(col, pd.Timestamp, datetime):
-                return col
+            if isinstance(col, (pd.Timestamp, datetime)):
+                return pd.Timestamp(col)
 
             if isinstance(col, (int, float)) and col > 10000:
                 return pd.to_datetime("1899-12-30") + pd.to_timedelta(col, unit='D')
