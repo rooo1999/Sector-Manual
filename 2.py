@@ -40,7 +40,7 @@ def read_portfolios_from_google_sheet(sheet_id):
     
     def parse_mixed_date(col):
         try:
-            if isinstance(col, pd.Timestamp):
+            if isinstance(col, pd.Timestamp, datetime):
                 return col
 
             if isinstance(col, (int, float)) and col > 10000:
@@ -82,9 +82,6 @@ def read_portfolios_from_google_sheet(sheet_id):
             df = df.dropna(how='all').dropna(how='all', axis=1)
             if df.empty or df.shape[1] < 2:
                 continue
-            
-            if sheet_name == "Core Active":
-                st.write("DEBUG raw columns:", [(repr(c), type(c)) for c in df.columns])
 
             df = df.rename(columns={df.columns[0]: 'Scheme Code'}).set_index('Scheme Code')
 
