@@ -210,6 +210,19 @@ def calculate_trailing_returns(series):
             
     return pd.Series(returns)
 
+def _dedupe_labels(labels):
+    """Appends (2), (3), ... to any repeated labels so a Styler never sees duplicate index/columns."""
+    seen = {}
+    result = []
+    for lab in labels:
+        if lab in seen:
+            seen[lab] += 1
+            result.append(f"{lab} ({seen[lab]})")
+        else:
+            seen[lab] = 0
+            result.append(lab)
+    return result
+
 def style_table(styler, format_str, na_rep, cmap, weight_col=None):
     """Applies consistent styling to a DataFrame Styler object."""
     cols = list(styler.data.columns)
@@ -475,8 +488,8 @@ if run_button or not st.session_state.analysis_run:
             
             st.markdown("##### **Individual Funds (Periodic)**")
             df_fund_periodic = results['periodic_fund_returns'].mul(100)
-            df_fund_periodic.columns = [c.strftime('%b-%Y') for c in df_fund_periodic.columns]
-            df_fund_periodic.index = df_fund_periodic.index.map(fund_names_map)
+            df_fund_periodic.columns = _dedupe_labels([c.strftime('%b-%Y') for c in df_fund_periodic.columns])
+            df_fund_periodic.index = _dedupe_labels(df_fund_periodic.index.map(fund_names_map))
             df_fund_periodic['Weight'] = results['allocations'].iloc[:, -1].values
             st.dataframe(style_table(df_fund_periodic.style, '{:.2f}%', 'None', excel_cmap, 'Weight'), use_container_width=True)
 
@@ -485,7 +498,7 @@ if run_button or not st.session_state.analysis_run:
             portfolio_periodic.name = f"📊 {name} Portfolio"
             benchmark_periodic = results['benchmark_periodic_returns'].T.mul(100)
             combined_periodic = pd.concat([portfolio_periodic.to_frame().T, benchmark_periodic])
-            combined_periodic.columns = [c.strftime('%b-%Y') for c in combined_periodic.columns]
+            combined_periodic.columns = _dedupe_labels([c.strftime('%b-%Y') for c in combined_periodic.columns])
             st.dataframe(style_table(combined_periodic.style, '{:.2f}%', 'None', excel_cmap), use_container_width=True)
             
     # Set the flag to True after the first successful run.
