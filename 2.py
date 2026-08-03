@@ -40,7 +40,7 @@ def read_portfolios_from_google_sheet(sheet_id):
     
     def parse_mixed_date(col):
         try:
-            if isinstance(col, pd.Timestamp, datetime):
+            if isinstance(col, pd.Timestamp):
                 return col
 
             if isinstance(col, (int, float)) and col > 10000:
