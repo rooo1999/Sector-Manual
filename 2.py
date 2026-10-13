@@ -105,9 +105,6 @@ def read_portfolios_from_google_sheet(sheet_id):
 
             df = df[valid_date_cols].sort_index(axis=1)
 
-            # Optional debug
-            st.info(f"✅ '{sheet_name}' parsed {len(df.columns)} date columns")
-
             cleaned_portfolios[sheet_name] = df
 
         return cleaned_portfolios
